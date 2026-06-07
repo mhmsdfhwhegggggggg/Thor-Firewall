@@ -30,7 +30,7 @@ peft>=0.11.0           # LoRA fine-tuning
 accelerate>=0.31.0     # تسريع التدريب
 bitsandbytes>=0.43.0   # Quantization (8-bit/4-bit)
 datasets>=2.20.0       # مجموعات بيانات التدريب
-tokenizers>=0.19.0
+tokenizers>=0.23.1
 
 # LLM Serving
 llama-cpp-python>=0.2.80  # تشغيل محلي للنماذج
