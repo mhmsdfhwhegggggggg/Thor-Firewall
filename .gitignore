@@ -1,0 +1,15 @@
+/target/
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.so
+*.o
+*.elf
+*.pcap
+*.log
+*.key
+*.pem
+.env
+*.pkl
+secret/
