@@ -205,3 +205,24 @@ Format: [version] — date — summary
 | threat_intel.py | 670 | 5 feeds + MISP + OTX + STIX 2.1 |
 | fed_learning.py | 623 | FedAvg + DP-SGD + FedProx |
 | main.py | 216 | All services wired |
+
+---
+
+## [0.4.0] — 2026-06-07 — Phase 4: Production REST ML Client + Self-Healing Agent
+
+### Changed
+
+#### Complete `agent/src/rl_core.rs` (635 lines — replaces stub)
+- `call_rest_api`: real reqwest HTTP client
+  - POST `{ML_URL}/v1/analyze/batch` with JSON payload
+  - MLBatchRequest/Response typed serde structs
+  - Exponential backoff retry (2 retries, 50/100/200ms delays)
+  - Handles: timeout, connect failure, 429/503 server errors
+  - Graceful fallback: simulation on any failure (never blocks traffic)
+  - Connection pooling: pool_max_idle_per_host=8, tcp_keepalive=30s
+- `analyze_raw`: new method for gRPC AnalyzeBatch — takes &[f32] features directly
+- `call_python_model`: PyO3 feature-gated, graceful fallback if not compiled
+- FlowKey::zero() stub for cases where flow_key is unavailable in raw calls
+- Improved simulation heuristics: 5 patterns (SYN-only, port scan, high-entropy C2, exfiltration, bot-speed)
+- EMA latency tracking: 99% old + 1% new per batch
+- Stats: added http_errors + http_fallbacks counters
