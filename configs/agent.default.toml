@@ -1,0 +1,95 @@
+# Thor Firewall Agent — Default Configuration
+# إعدادات العميل الافتراضية
+
+[agent]
+# وضع التشغيل: enforcement أو dry_run
+mode = "enforcement"
+# معرف المثيل (للنشر متعدد الخوادم)
+instance_id = "thor-agent-001"
+
+[grpc]
+# عنوان خادم gRPC للتواصل مع control plane
+host = "0.0.0.0"
+port = 50051
+# تشفير TLS
+tls_enabled = true
+cert_path = "/etc/thor/certs/agent.crt"
+key_path = "/etc/thor/certs/agent.key"
+ca_cert_path = "/etc/thor/certs/ca.crt"
+
+[metrics]
+# منفذ Prometheus metrics
+port = 9090
+path = "/metrics"
+
+[parser]
+# تفعيل حساب entropy للحمولة
+compute_entropy = true
+# الحد الأقصى لحجم الحزمة (bytes)
+max_packet_size = 65535
+# فك تشفير VXLAN tunnels
+unwrap_vxlan = true
+
+[flow]
+# الحد الأقصى للتدفقات المتزامنة
+max_flows = 1_000_000
+# مهلة التدفق الخامل (ثوانٍ)
+idle_timeout_secs = 60
+# مهلة التدفق الكلية (ساعة)
+total_timeout_secs = 3600
+# عدد SYN قبل التحليل
+syn_analysis_threshold = 10
+# Redis URL
+redis_url = "redis://localhost:6379/0"
+
+[rl]
+# وضع التشغيل: simulation | rest_api | in_process
+mode = "rest_api"
+# عنوان خادم ML (FastAPI)
+[rl.rest_api]
+url = "http://localhost:8080/api/v1/ml/infer"
+# حجم الدفعة
+batch_size = 64
+# مهلة الدفعة (ميكروثانية)
+batch_timeout_us = 1000
+# الحد الأقصى للطلبات المعلقة
+max_pending = 10_000
+# عتبة الحظر التلقائي
+auto_block_threshold = 0.85
+# عتبة المراقبة المكثفة
+suspicious_threshold = 0.5
+
+# إعدادات Linux (eBPF/XDP)
+[linux]
+# واجهة الشبكة
+interface = "eth0"
+# وضع XDP: native | skb | offload
+xdp_mode = "native"
+# الحد الأقصى لـ SYN/ثانية لكل IP
+syn_rate_limit = 1000
+# تفعيل تسجيل BPF
+enable_bpf_logging = false
+
+# إعدادات Windows (WFP)
+[windows]
+# اسم CalloutDriver
+driver_name = "ThorCallout"
+# Named pipe للتواصل
+pipe_name = "\\\\.\\pipe\\ThorAgent"
+
+[logging]
+# مستوى السجل: trace | debug | info | warn | error
+level = "info"
+# تنسيق السجل: json | text
+format = "json"
+# ملف السجل (فارغ = stdout فقط)
+file = "/var/log/thor/agent.log"
+# تدوير السجل
+max_file_size_mb = 100
+max_files = 10
+
+[telemetry]
+# OpenTelemetry endpoint
+otlp_endpoint = ""
+# اسم الخدمة في Jaeger/Tempo
+service_name = "thor-agent"

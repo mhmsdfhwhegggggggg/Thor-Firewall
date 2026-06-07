@@ -1,0 +1,99 @@
+[workspace]
+members = [
+    "agent",
+    "kernel-modules/windows/wfp",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Thor Firewall Team <team@thor-firewall.io>"]
+license = "GPL-3.0"
+repository = "https://github.com/mhmsdfhwhegggggggg/Thor-Firewall"
+homepage = "https://thor-firewall.io"
+documentation = "https://docs.thor-firewall.io"
+keywords = ["firewall", "ebpf", "xdp", "security", "ngfw"]
+categories = ["network-programming", "os"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.39", features = ["full"] }
+tokio-util = { version = "0.7", features = ["full"] }
+
+# eBPF (Linux only)
+aya = { version = "0.13", features = ["async_tokio"] }
+aya-log = "0.2"
+
+# Networking
+pnet = "0.35"
+pnet_datalink = "0.35"
+etherparse = "0.15"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "2.0"
+prost = "0.13"
+
+# gRPC
+tonic = { version = "0.12", features = ["tls"] }
+tonic-build = "0.12"
+
+# Storage
+redis = { version = "0.26", features = ["tokio-comp", "connection-manager"] }
+
+# Logging & Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.25"
+opentelemetry = "0.24"
+opentelemetry-otlp = { version = "0.17", features = ["tonic"] }
+
+# Metrics
+prometheus = { version = "0.13", features = ["process"] }
+
+# ML bridge (FFI to Python)
+pyo3 = { version = "0.22", features = ["auto-initialize"] }
+
+# Cryptography
+ring = "0.17"
+blake3 = "1.5"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Configuration
+config = "0.14"
+toml = "0.8"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Concurrency
+crossbeam = "0.8"
+dashmap = "6.0"
+parking_lot = "0.12"
+rayon = "1.10"
+
+# System
+nix = { version = "0.29", features = ["net", "process", "signal", "fs"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+strip = false
+
+[profile.bench]
+inherits = "release"
+debug = true

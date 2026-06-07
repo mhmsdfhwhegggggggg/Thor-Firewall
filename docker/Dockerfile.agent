@@ -1,0 +1,62 @@
+# Thor Firewall Agent — Multi-stage Docker Build
+# مرحلة البناء
+
+FROM rust:1.79-slim-bookworm AS builder
+
+WORKDIR /build
+
+# تثبيت تبعيات البناء
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang \
+    llvm \
+    libbpf-dev \
+    linux-headers-generic \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# نسخ الملفات
+COPY Cargo.toml Cargo.lock ./
+COPY agent/ ./agent/
+
+# بناء في وضع الإصدار
+RUN cargo build --release --package thor-agent
+
+# ──────────────────────────────────────────────────────────────────────────
+# مرحلة التشغيل (Minimal runtime image)
+FROM debian:bookworm-slim AS runtime
+
+LABEL org.opencontainers.image.title="Thor Firewall Agent"
+LABEL org.opencontainers.image.description="Next-Generation Firewall Agent — eBPF/MARL/GNN"
+LABEL org.opencontainers.image.version="0.1.0"
+LABEL org.opencontainers.image.licenses="GPL-3.0"
+
+# تثبيت التبعيات الأساسية فقط
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libbpf0 \
+    libssl3 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# إنشاء مستخدم غير متميز
+RUN useradd -r -s /bin/false -u 1001 thor
+
+# نسخ الثنائي
+COPY --from=builder /build/target/release/thor-agent /usr/local/bin/thor-agent
+
+# إعداد الدلائل
+RUN mkdir -p /etc/thor /var/log/thor /var/lib/thor \
+    && chown -R thor:thor /etc/thor /var/log/thor /var/lib/thor
+
+# ملف الإعداد الافتراضي
+COPY configs/agent.default.toml /etc/thor/agent.toml
+
+USER thor
+
+EXPOSE 50051 9090
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:9090/health || exit 1
+
+ENTRYPOINT ["thor-agent"]
+CMD ["--config", "/etc/thor/agent.toml"]
