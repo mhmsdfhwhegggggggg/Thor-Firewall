@@ -144,3 +144,64 @@ Format: [version] — date — summary
 - CI/CD pipeline (GitHub Actions)
 - Proto definition (thor.proto — complete)
 - ML stubs (MARL agents, GNN, LLM)
+
+---
+
+## [0.3.0] — 2026-06-07 — Phase 3: Operational Completeness & Global Intelligence
+
+### Added
+
+#### Docker Compose Production Stack (`docker-compose.yml` — 385 lines)
+- 8 services: thor-agent, control-plane, ml-inference, clickhouse, redis, dashboard, prometheus, grafana
+- thor-agent: hostNetwork + CAP_NET_ADMIN/BPF/SYS_ADMIN + ulimits memlock=-1 + BPF fs mount
+- ml-inference: GPU support (NVIDIA device plugin), 4GB RAM limit, 60s startup probe
+- ClickHouse: 24.3-alpine, named volumes (bind-mount to DATA_DIR)
+- Redis 7.2: maxmemory LRU + AOF persistence + requirepass
+- Grafana: pre-provisioned datasources + clickhouse plugin + worldmap
+- Networks: thor-internal (172.20.0.0/24) + thor-frontend (172.20.1.0/24)
+- Volumes: thor-models (bind), thor-clickhouse-data (bind), thor-redis-data (bind)
+
+#### Kubernetes Manifests (`k8s/` — 458 lines total)
+- `k8s/agent/daemonset.yaml` — DaemonSet: hostNetwork, hostPID, system-node-critical priority, init BPF loader, HPA-safe (tolerations: Exists)
+- `k8s/control-plane/deployment.yaml` — 3 replicas, HPA (3-12, CPU 70%), RollingUpdate, Ingress + cert-manager TLS
+- `k8s/clickhouse/statefulset.yaml` — StatefulSet, 500Gi PVC (fast-ssd), liveness/readiness via clickhouse-client
+- `k8s/namespace.yaml` — Namespace + ResourceQuota (32 CPU / 64Gi) + NetworkPolicy (default-deny + allow-internal)
+- All manifests: ServiceAccount, Service (Headless for agent), Ingress
+
+#### Threat Intelligence Service (`control-plane/src/services/threat_intel.py` — 670 lines)
+- 5 free feeds: Emerging Threats (compromised + botcc), Feodo Tracker, ThreatFox, CINS Army
+- Feed refresh loop: every 6h, Redis SADD + HSET for O(1) IP lookup
+- MISP integration: REST API with Attribute restSearch, tag extraction
+- AlienVault OTX integration: pulse_count→score, country, threat_types
+- AbuseIPDB integration: confidence score, tor exit, ISP/ASN
+- `lookup_ip`: 3-tier cache (in-memory L1 → Redis L2 → live L3)
+- `enrich_flow`: parallel src_ip + dst_ip lookup
+- `export_stix_bundle`: STIX 2.1 bundle with indicators, kill_chain_phases, external_references
+- Private range exclusion (RFC1918, loopback, IPv6 ULA)
+- `get_reputation_batch`: parallel asyncio.gather for bulk lookups
+
+#### Updated Control Plane (`control-plane/src/main.py` — 216 lines)
+- ClickHouseConfig from environment variables + `init_clickhouse()` at startup
+- ThreatIntelService startup with MISP/OTX/AbuseIPDB config
+- Forensics router registered (GET /forensics/*)
+- Prometheus instrumentator: exclude /health + /metrics endpoints
+- Version bump to 0.3.0 in FastAPI metadata
+
+#### Federated Learning Framework (`ml/federated/fed_learning.py` — 623 lines)
+- `FederatedServer`: FedAvg aggregation, round management, checkpoint save/load
+- `FederatedClient`: full round lifecycle (fetch → local train → delta → send)
+- `DPSGDEngine`: gradient clipping (L2 norm ≤ C), Gaussian noise addition, ε accountant
+- FedProx proximal term: prevents client drift (μ=0.01)
+- Sparsification: keeps only |delta_ij| > 0.001 (reduces bandwidth 70-95%)
+- FastAPI router: /federated/model, /federated/update, /federated/metrics, /federated/status
+- CLI: `python -m ml.federated.fed_learning --client-id x --server-url y --rounds 10`
+
+### Phase 3 Metrics
+
+| Component | Lines | Key Capability |
+|-----------|-------|---------------|
+| docker-compose.yml | 385 | 8-service production stack |
+| k8s/*.yaml | 458 | DaemonSet + HPA + StatefulSet |
+| threat_intel.py | 670 | 5 feeds + MISP + OTX + STIX 2.1 |
+| fed_learning.py | 623 | FedAvg + DP-SGD + FedProx |
+| main.py | 216 | All services wired |

@@ -1,0 +1,93 @@
+# ClickHouse — StatefulSet for OLAP forensics (3 shards)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: thor-clickhouse
+  namespace: thor-system
+  labels:
+    app: thor-clickhouse
+    component: storage
+spec:
+  serviceName: thor-clickhouse
+  replicas: 1        # Single-node start; upgrade to cluster with ClickHouse Operator
+  selector:
+    matchLabels:
+      app: thor-clickhouse
+  template:
+    metadata:
+      labels:
+        app: thor-clickhouse
+        component: storage
+    spec:
+      securityContext:
+        runAsUser: 101       # clickhouse user
+        fsGroup: 101
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:24.3-alpine
+          ports:
+            - name: http
+              containerPort: 8123
+            - name: native
+              containerPort: 9000
+          env:
+            - name: CLICKHOUSE_DB
+              value: thor
+            - name: CLICKHOUSE_USER
+              value: thor_agent
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: thor-secrets
+                  key: clickhouse-password
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
+              cpu: "8"
+              memory: 32Gi
+          volumeMounts:
+            - name: clickhouse-data
+              mountPath: /var/lib/clickhouse
+            - name: clickhouse-logs
+              mountPath: /var/log/clickhouse-server
+          livenessProbe:
+            exec:
+              command: ["clickhouse-client", "--query", "SELECT 1"]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          readinessProbe:
+            exec:
+              command: ["clickhouse-client", "--query", "SELECT 1"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: clickhouse-logs
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: clickhouse-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: fast-ssd     # استخدم SSD للأداء المثلى
+        resources:
+          requests:
+            storage: 500Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: thor-clickhouse
+  namespace: thor-system
+spec:
+  selector:
+    app: thor-clickhouse
+  ports:
+    - name: http
+      port: 8123
+      targetPort: 8123
+    - name: native
+      port: 9000
+      targetPort: 9000
+  type: ClusterIP

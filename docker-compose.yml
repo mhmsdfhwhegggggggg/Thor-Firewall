@@ -1,0 +1,385 @@
+# Thor Firewall — Production Docker Compose
+# يُشغّل الـ stack الكامل على node واحد
+#
+# الخدمات:
+#   thor-agent       — Rust eBPF agent (يحتاج privileges)
+#   control-plane    — FastAPI API server
+#   ml-inference     — PyTorch ML server
+#   clickhouse       — OLAP forensics database
+#   redis            — Cache + Pub/Sub + Event bus
+#   dashboard        — React + Vite frontend
+#   grafana          — Prometheus dashboards
+#   prometheus       — Metrics collection
+#
+# الاستخدام:
+#   docker-compose up -d
+#   docker-compose logs -f thor-agent
+#
+# المتطلبات:
+#   - Docker >= 24.0
+#   - Linux kernel >= 5.15 (للـ eBPF)
+#   - RAM >= 8GB, CPU >= 4 cores
+
+services:
+
+  # ──────────────────────────────────────────────────────────────────
+  # Thor Agent — Rust eBPF/XDP packet processor
+  # يحتاج CAP_NET_ADMIN + CAP_BPF + CAP_SYS_ADMIN للـ eBPF
+  # ──────────────────────────────────────────────────────────────────
+  thor-agent:
+    image: thor-firewall/agent:${THOR_VERSION:-0.3.0}
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+      target: production
+    container_name: thor-agent
+    restart: unless-stopped
+    network_mode: host          # XDP يحتاج الوصول المباشر للشبكة
+    pid: host                   # للوصول لـ /proc معلومات العمليات
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN               # BPF program loading
+      - SYS_PTRACE              # Memory introspection
+      - IPC_LOCK                # Locked memory for BPF maps
+    security_opt:
+      - no-new-privileges:false # BPF يحتاج هذا
+    ulimits:
+      memlock:
+        soft: -1                # Unlimited locked memory (BPF maps)
+        hard: -1
+    volumes:
+      - /sys/fs/bpf:/sys/fs/bpf           # BPF virtual filesystem
+      - /sys/kernel/debug:/sys/kernel/debug:ro  # debugfs
+      - ./config/agent.toml:/etc/thor/agent.toml:ro
+      - thor-agent-logs:/var/log/thor
+    environment:
+      THOR_ENV: ${THOR_ENV:-production}
+      THOR_GRPC_TOKEN: ${THOR_GRPC_TOKEN}
+      RUST_LOG: ${RUST_LOG:-thor_agent=info,warn}
+    ports:
+      - "127.0.0.1:9090:9090"   # Prometheus metrics (لا يُكشف للخارج)
+      - "127.0.0.1:50051:50051" # gRPC (TLS-only في production)
+    healthcheck:
+      test: ["CMD", "grpc_health_probe", "-addr=:50051"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      redis:
+        condition: service_healthy
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ──────────────────────────────────────────────────────────────────
+  # Control Plane — FastAPI API Server
+  # ──────────────────────────────────────────────────────────────────
+  control-plane:
+    image: thor-firewall/control-plane:${THOR_VERSION:-0.3.0}
+    build:
+      context: ./control-plane
+      dockerfile: Dockerfile
+    container_name: thor-control-plane
+    restart: unless-stopped
+    networks:
+      - thor-internal
+      - thor-frontend
+    environment:
+      PORT: "8000"
+      REDIS_URL: redis://redis:6379/0
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_DB: thor
+      CLICKHOUSE_USER: thor_agent
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-thor_secure_pass}
+      ML_INFERENCE_URL: http://ml-inference:8082
+      GRPC_AGENT_HOST: thor-agent
+      GRPC_AGENT_PORT: "50051"
+      THOR_GRPC_TOKEN: ${THOR_GRPC_TOKEN}
+      MISP_URL: ${MISP_URL:-}
+      MISP_KEY: ${MISP_KEY:-}
+      OTX_KEY: ${OTX_KEY:-}
+      ABUSEIPDB_KEY: ${ABUSEIPDB_KEY:-}
+      LLM_SERVER_URL: ${LLM_SERVER_URL:-http://localhost:8081}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://dashboard:3000}
+      WORKERS: ${CP_WORKERS:-4}
+    ports:
+      - "${CP_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    volumes:
+      - ./control-plane:/app:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ──────────────────────────────────────────────────────────────────
+  # ML Inference Server — MARL + GNN + LLM
+  # ──────────────────────────────────────────────────────────────────
+  ml-inference:
+    image: thor-firewall/ml-inference:${THOR_VERSION:-0.3.0}
+    build:
+      context: .
+      dockerfile: ml/Dockerfile
+    container_name: thor-ml-inference
+    restart: unless-stopped
+    networks:
+      - thor-internal
+    environment:
+      PORT: "8082"
+      REDIS_URL: redis://redis:6379/1
+      MODEL_PATH: /models
+      DEVICE: ${ML_DEVICE:-cpu}   # "cuda" إذا توفر GPU
+      BATCH_SIZE: ${ML_BATCH_SIZE:-64}
+      LOG_LEVEL: info
+    ports:
+      - "127.0.0.1:8082:8082"
+    volumes:
+      - thor-models:/models       # تخزين النماذج المُدرَّبة
+      - ./ml:/app/ml:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "${ML_CPUS:-4}"
+          memory: "${ML_MEMORY:-4G}"
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 60s       # النماذج تحتاج وقتاً للتحميل
+    depends_on:
+      redis:
+        condition: service_healthy
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+  # ──────────────────────────────────────────────────────────────────
+  # ClickHouse — OLAP Forensics Database
+  # ──────────────────────────────────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    container_name: thor-clickhouse
+    restart: unless-stopped
+    networks:
+      - thor-internal
+    environment:
+      CLICKHOUSE_DB: thor
+      CLICKHOUSE_USER: thor_agent
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-thor_secure_pass}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "127.0.0.1:8123:8123"   # HTTP interface (API + queries)
+      - "127.0.0.1:9000:9000"   # Native protocol (faster)
+    volumes:
+      - thor-clickhouse-data:/var/lib/clickhouse
+      - thor-clickhouse-logs:/var/log/clickhouse-server
+      - ./config/clickhouse/config.xml:/etc/clickhouse-server/config.xml:ro
+      - ./config/clickhouse/users.xml:/etc/clickhouse-server/users.xml:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+  # ──────────────────────────────────────────────────────────────────
+  # Redis — Cache + Pub/Sub + Event Bus
+  # ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    container_name: thor-redis
+    restart: unless-stopped
+    networks:
+      - thor-internal
+    command: >
+      redis-server
+      --maxmemory ${REDIS_MAX_MEMORY:-2gb}
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+      --appendonly yes
+      --appendfsync everysec
+      --requirepass ${REDIS_PASSWORD:-thor_redis_pass}
+      --loglevel notice
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - thor-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-thor_redis_pass}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  # ──────────────────────────────────────────────────────────────────
+  # Dashboard — React + Vite Frontend
+  # ──────────────────────────────────────────────────────────────────
+  dashboard:
+    image: thor-firewall/dashboard:${THOR_VERSION:-0.3.0}
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+    container_name: thor-dashboard
+    restart: unless-stopped
+    networks:
+      - thor-frontend
+    ports:
+      - "${DASHBOARD_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ──────────────────────────────────────────────────────────────────
+  # Prometheus — Metrics Scraping
+  # ──────────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: thor-prometheus
+    restart: unless-stopped
+    networks:
+      - thor-internal
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+      - --web.console.templates=/usr/share/prometheus/consoles
+      - --web.enable-lifecycle
+    ports:
+      - "127.0.0.1:9091:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - thor-prometheus-data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ──────────────────────────────────────────────────────────────────
+  # Grafana — Dashboards + Alerting
+  # ──────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.3.0
+    container_name: thor-grafana
+    restart: unless-stopped
+    networks:
+      - thor-internal
+      - thor-frontend
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-thor_grafana_pass}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: grafana-clickhouse-datasource,grafana-worldmap-panel
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3001}
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    volumes:
+      - thor-grafana-data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# ──────────────────────────────────────────────────────────────────
+# Networks
+# ──────────────────────────────────────────────────────────────────
+networks:
+  thor-internal:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+    driver_opts:
+      com.docker.network.bridge.name: thor-internal
+  thor-frontend:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.1.0/24
+
+# ──────────────────────────────────────────────────────────────────
+# Volumes
+# ──────────────────────────────────────────────────────────────────
+volumes:
+  thor-agent-logs:
+    driver: local
+  thor-clickhouse-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_DIR:-/var/thor}/clickhouse
+  thor-clickhouse-logs:
+    driver: local
+  thor-redis-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_DIR:-/var/thor}/redis
+  thor-prometheus-data:
+    driver: local
+  thor-grafana-data:
+    driver: local
+  thor-models:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_DIR:-/var/thor}/models

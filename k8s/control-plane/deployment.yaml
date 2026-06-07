@@ -1,0 +1,152 @@
+# Thor Control Plane — Deployment + HPA + Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: thor-control-plane
+  namespace: thor-system
+  labels:
+    app: thor-control-plane
+    component: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: thor-control-plane
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: thor-control-plane
+        component: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/api/metrics"
+    spec:
+      serviceAccountName: thor-control-plane
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: control-plane
+          image: thor-firewall/control-plane:0.3.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: PORT
+              value: "8000"
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: thor-secrets
+                  key: redis-url
+            - name: CLICKHOUSE_HOST
+              value: thor-clickhouse.thor-system.svc.cluster.local
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: thor-secrets
+                  key: clickhouse-password
+            - name: THOR_GRPC_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: thor-secrets
+                  key: grpc-token
+            - name: ML_INFERENCE_URL
+              value: http://thor-ml-inference.thor-system.svc.cluster.local:8082
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: thor-control-plane
+  namespace: thor-system
+spec:
+  selector:
+    app: thor-control-plane
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: thor-control-plane-hpa
+  namespace: thor-system
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: thor-control-plane
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: thor-api-ingress
+  namespace: thor-system
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "60"
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.thor-firewall.example.com
+      secretName: thor-api-tls
+  rules:
+    - host: api.thor-firewall.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: thor-control-plane
+                port:
+                  number: 8000

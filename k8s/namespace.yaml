@@ -1,0 +1,60 @@
+# Thor Firewall — Kubernetes Namespace + RBAC + Secrets template
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: thor-system
+  labels:
+    name: thor-system
+    istio-injection: enabled    # إذا كان Istio service mesh مُثبَّتاً
+---
+# ResourceQuota لمنع استهلاك موارد مفرط
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: thor-quota
+  namespace: thor-system
+spec:
+  hard:
+    requests.cpu: "32"
+    requests.memory: 64Gi
+    limits.cpu: "64"
+    limits.memory: 128Gi
+    persistentvolumeclaims: "10"
+---
+# NetworkPolicy — فصل الشبكات داخلياً
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: thor-default-deny
+  namespace: thor-system
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: thor-allow-internal
+  namespace: thor-system
+spec:
+  podSelector:
+    matchLabels:
+      component: api
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: thor-system
+        - podSelector: {}
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: thor-system
+    - to:    # DNS
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP

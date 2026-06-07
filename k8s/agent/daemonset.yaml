@@ -1,0 +1,153 @@
+# Thor Agent — DaemonSet
+# يُشغَّل نسخة واحدة على كل node في الـ cluster
+# XDP يحتاج الوصول المباشر للشبكة الفيزيائية
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: thor-agent
+  namespace: thor-system
+  labels:
+    app: thor-agent
+    component: dataplane
+    version: "0.3.0"
+spec:
+  selector:
+    matchLabels:
+      app: thor-agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: thor-agent
+        component: dataplane
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      hostNetwork: true        # XDP يحتاج الشبكة الفيزيائية للـ host
+      hostPID: true            # للوصول لـ /proc معلومات العمليات
+      dnsPolicy: ClusterFirstWithHostNet
+      serviceAccountName: thor-agent
+      priorityClassName: system-node-critical   # أعلى أولوية — لا يُطرد
+      tolerations:
+        - operator: Exists     # يعمل على جميع nodes بما فيها master
+      nodeSelector:
+        kubernetes.io/os: linux
+      initContainers:
+        # تحميل برامج eBPF قبل بدء الـ agent
+        - name: ebpf-loader
+          image: thor-firewall/agent:0.3.0
+          command: ["/usr/local/bin/thor-ebpf-loader"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: bpf-fs
+              mountPath: /sys/fs/bpf
+            - name: debugfs
+              mountPath: /sys/kernel/debug
+      containers:
+        - name: thor-agent
+          image: thor-firewall/agent:0.3.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/local/bin/thor-agent
+            - --config=/etc/thor/agent.toml
+          env:
+            - name: THOR_ENV
+              value: production
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: THOR_GRPC_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: thor-secrets
+                  key: grpc-token
+            - name: RUST_LOG
+              value: thor_agent=info,warn
+          ports:
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 500m
+              memory: 256Mi
+            limits:
+              cpu: "4"
+              memory: 2Gi
+          securityContext:
+            privileged: false
+            capabilities:
+              add:
+                - NET_ADMIN
+                - NET_RAW
+                - SYS_ADMIN
+                - SYS_PTRACE
+                - IPC_LOCK
+            allowPrivilegeEscalation: true
+          volumeMounts:
+            - name: bpf-fs
+              mountPath: /sys/fs/bpf
+            - name: debugfs
+              mountPath: /sys/kernel/debug
+              readOnly: true
+            - name: agent-config
+              mountPath: /etc/thor
+              readOnly: true
+          livenessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: bpf-fs
+          hostPath:
+            path: /sys/fs/bpf
+            type: Directory
+        - name: debugfs
+          hostPath:
+            path: /sys/kernel/debug
+            type: Directory
+        - name: agent-config
+          configMap:
+            name: thor-agent-config
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: thor-agent
+  namespace: thor-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: thor-agent
+  namespace: thor-system
+  labels:
+    app: thor-agent
+spec:
+  clusterIP: None     # Headless — control plane يتصل بكل agent مباشرة
+  selector:
+    app: thor-agent
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+    - name: metrics
+      port: 9090
+      targetPort: 9090
