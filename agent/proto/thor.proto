@@ -1,0 +1,291 @@
+syntax = "proto3";
+
+package thor.v1;
+
+option go_package = "github.com/thor-firewall/thor/proto/v1";
+
+// ============================================================================
+// Thor Firewall gRPC Service Definition
+// تعريف خدمة gRPC لنظام Thor Firewall
+// ============================================================================
+
+// خدمة العميل — Control Plane يتصل بها
+service ThorAgent {
+  // الحصول على إحصاءات النظام الحية
+  rpc GetStats(StatsRequest) returns (StatsResponse);
+
+  // تطبيق قرار على تدفق
+  rpc ApplyDecision(DecisionRequest) returns (DecisionResponse);
+
+  // تحديث قائمة الحظر
+  rpc UpdateBlacklist(BlacklistUpdate) returns (BlacklistUpdateResponse);
+
+  // تحديث قائمة السماح
+  rpc UpdateWhitelist(WhitelistUpdate) returns (WhitelistUpdateResponse);
+
+  // بث الأحداث الحية (Server-side streaming)
+  rpc StreamEvents(EventStreamRequest) returns (stream ThorEvent);
+
+  // إرسال دفعة تدريب لـ ML
+  rpc SendTrainingBatch(TrainingBatch) returns (TrainingResponse);
+
+  // تحديث الإعدادات في الزمن الحقيقي
+  rpc UpdateConfig(ConfigUpdate) returns (ConfigUpdateResponse);
+
+  // فحص الصحة
+  rpc HealthCheck(HealthRequest) returns (HealthResponse);
+}
+
+// خدمة ML — Agent يتصل بها للاستنتاج
+service ThorMLInference {
+  rpc Analyze(AnalysisRequest) returns (AnalysisResponse);
+  rpc AnalyzeBatch(AnalysisBatchRequest) returns (AnalysisBatchResponse);
+}
+
+// ============================================================================
+// Flow Messages
+// ============================================================================
+
+message FlowKey {
+  bytes src_ip = 1;   // 4 bytes (IPv4) أو 16 bytes (IPv6)
+  bytes dst_ip = 2;
+  uint32 src_port = 3;
+  uint32 dst_port = 4;
+  uint32 protocol = 5;
+  bool is_ipv6 = 6;
+}
+
+message FlowStats {
+  uint64 packets = 1;
+  uint64 bytes = 2;
+  double pps = 3;       // packets per second
+  double bps = 4;       // bits per second
+  uint64 first_seen_ns = 5;
+  uint64 last_seen_ns = 6;
+  float avg_packet_size = 7;
+  float packet_size_variance = 8;
+  uint32 retransmissions = 9;
+  float payload_entropy = 10;
+}
+
+message FlowRecord {
+  FlowKey key = 1;
+  FlowStats stats = 2;
+  FlowState state = 3;
+  Decision decision = 4;
+  float risk_score = 5;
+  float confidence = 6;
+  string explanation = 7;
+  repeated string tags = 8;
+}
+
+enum FlowState {
+  FLOW_STATE_UNKNOWN = 0;
+  FLOW_STATE_NEW = 1;
+  FLOW_STATE_ANALYZING = 2;
+  FLOW_STATE_ALLOWED = 3;
+  FLOW_STATE_BLOCKED = 4;
+  FLOW_STATE_SUSPICIOUS = 5;
+  FLOW_STATE_TERMINATED = 6;
+}
+
+enum Decision {
+  DECISION_UNKNOWN = 0;
+  DECISION_ALLOW = 1;
+  DECISION_BLOCK = 2;
+  DECISION_THROTTLE = 3;
+  DECISION_MIRROR = 4;
+  DECISION_REDIRECT = 5;
+}
+
+// ============================================================================
+// Stats Messages
+// ============================================================================
+
+message StatsRequest {
+  bool include_flows = 1;
+  bool include_ml = 2;
+  bool include_system = 3;
+}
+
+message StatsResponse {
+  NetworkStats network = 1;
+  MLStats ml = 2;
+  SystemStats system = 3;
+  uint64 timestamp_ns = 4;
+}
+
+message NetworkStats {
+  uint64 total_packets = 1;
+  uint64 total_bytes = 2;
+  double packets_per_second = 3;
+  double bits_per_second = 4;
+  uint64 active_flows = 5;
+  uint64 blocked_flows = 6;
+  uint64 suspicious_flows = 7;
+  float table_utilization = 8;
+}
+
+message MLStats {
+  uint64 total_analyzed = 1;
+  uint64 total_blocked = 2;
+  uint64 total_allowed = 3;
+  double avg_latency_us = 4;
+  uint64 false_positives = 5;
+  uint64 false_negatives = 6;
+  float current_accuracy = 7;
+}
+
+message SystemStats {
+  float cpu_usage_pct = 1;
+  uint64 memory_bytes = 2;
+  float ebpf_map_utilization = 3;
+  string kernel_version = 4;
+  string agent_version = 5;
+  uint64 uptime_secs = 6;
+}
+
+// ============================================================================
+// Decision Messages
+// ============================================================================
+
+message DecisionRequest {
+  uint64 flow_key_hash = 1;
+  Decision decision = 2;
+  float risk_score = 3;
+  float confidence = 4;
+  string explanation = 5;
+  string agent_id = 6;
+  uint32 throttle_rate_pps = 7;   // للقرار THROTTLE
+  uint32 redirect_port = 8;        // للقرار REDIRECT
+}
+
+message DecisionResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// ============================================================================
+// Blacklist/Whitelist Messages
+// ============================================================================
+
+message BlacklistUpdate {
+  string cidr = 1;    // e.g., "192.168.1.0/24"
+  string action = 2;  // "add" | "remove"
+  string reason = 3;
+  uint64 expires_at = 4;  // 0 = لا تنتهي
+}
+
+message BlacklistUpdateResponse {
+  bool success = 1;
+  uint32 total_entries = 2;
+}
+
+message WhitelistUpdate {
+  string cidr = 1;
+  string action = 2;
+}
+
+message WhitelistUpdateResponse {
+  bool success = 1;
+}
+
+// ============================================================================
+// Event Streaming
+// ============================================================================
+
+message EventStreamRequest {
+  repeated string event_types = 1;  // فارغ = كل الأحداث
+  float min_risk_score = 2;
+}
+
+message ThorEvent {
+  string event_id = 1;
+  string event_type = 2;   // "flow_blocked", "threat_detected", "stats_update"
+  uint64 timestamp_ns = 3;
+  float risk_score = 4;
+  string severity = 5;     // "low", "medium", "high", "critical"
+  FlowRecord flow = 6;
+  string explanation = 7;
+  string agent_id = 8;
+}
+
+// ============================================================================
+// Training Messages
+// ============================================================================
+
+message TrainingBatch {
+  repeated TrainingSample samples = 1;
+  string protocol = 2;  // tcp/udp/icmp
+}
+
+message TrainingSample {
+  repeated float features = 1;
+  int32 action_taken = 2;
+  float reward = 3;
+  bool was_attack = 4;
+}
+
+message TrainingResponse {
+  bool accepted = 1;
+  uint32 queue_size = 2;
+}
+
+// ============================================================================
+// Config Messages
+// ============================================================================
+
+message ConfigUpdate {
+  uint32 syn_rate_limit = 1;
+  uint32 sample_rate = 2;
+  float auto_block_threshold = 3;
+  float suspicious_threshold = 4;
+}
+
+message ConfigUpdateResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// ============================================================================
+// Health Messages
+// ============================================================================
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;   // "healthy", "degraded", "unhealthy"
+  string version = 2;
+  uint64 uptime_secs = 3;
+  map<string, string> components = 4;
+}
+
+// ============================================================================
+// ML Inference Messages
+// ============================================================================
+
+message AnalysisRequest {
+  FlowKey flow_key = 1;
+  repeated float features = 2;    // 50 features
+  repeated float gnn_embedding = 3;  // 32 features from GNN
+  string protocol = 4;
+}
+
+message AnalysisResponse {
+  uint64 flow_key_hash = 1;
+  Decision decision = 2;
+  float risk_score = 3;
+  float confidence = 4;
+  string explanation = 5;
+  string agent_id = 6;
+  uint64 inference_time_us = 7;
+}
+
+message AnalysisBatchRequest {
+  repeated AnalysisRequest requests = 1;
+}
+
+message AnalysisBatchResponse {
+  repeated AnalysisResponse responses = 1;
+  uint64 total_time_us = 2;
+}
