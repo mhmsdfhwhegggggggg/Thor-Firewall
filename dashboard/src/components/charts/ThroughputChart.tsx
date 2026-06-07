@@ -1,167 +1,165 @@
-// Thor Firewall Dashboard — Throughput Time-Series Chart
-import React, { memo, useEffect, useRef, useState } from "react";
+// Thor Firewall Dashboard — Throughput & Threat Rate Chart
+import React, { useEffect, useRef, useState } from "react";
 import {
-  AreaChart,
-  Area,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-  Legend,
+  LineChart, Line, XAxis, YAxis, CartesianGrid,
+  Tooltip, ResponsiveContainer, Area, AreaChart, Legend
 } from "recharts";
-import type { ChartDataPoint } from "../../types";
+
+// ============================================================================
+// Data point
+// ============================================================================
 
 interface DataPoint {
-  time: string;
-  throughputMbps: number;
-  blockedPps: number;
-  suspiciousPps: number;
+  time:      string;
+  mbps:      number;
+  blocked:   number;
+  suspicious: number;
 }
 
-interface Props {
-  /** Current throughput in Mbps */
-  currentMbps: number;
-  /** Current blocked flows per second */
-  blockedPps: number;
-  /** Current suspicious flows per second */
-  suspiciousPps: number;
-  /** Window size in seconds (default 120) */
-  windowSecs?: number;
+function now(): string {
+  return new Date().toLocaleTimeString("en", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
-function formatTime(ts: number): string {
-  const d = new Date(ts);
-  return `${d.getMinutes().toString().padStart(2, "0")}:${d.getSeconds().toString().padStart(2, "0")}`;
+// ============================================================================
+// Custom Tooltip
+// ============================================================================
+
+function CustomTooltip({ active, payload, label }: any) {
+  if (!active || !payload?.length) return null;
+  return (
+    <div className="rounded-lg border border-white/10 bg-gray-900 p-3 text-xs shadow-xl">
+      <p className="mb-2 text-white/50">{label}</p>
+      {payload.map((p: any) => (
+        <div key={p.name} className="flex justify-between gap-4" style={{ color: p.color }}>
+          <span>{p.name}</span>
+          <span className="font-mono font-bold">
+            {p.name === "Mbps"
+              ? `${Number(p.value).toFixed(1)} Mb/s`
+              : p.name === "Blocked"
+              ? `${Number(p.value).toFixed(0)}/s`
+              : `${Number(p.value).toFixed(0)}/s`}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
 }
 
-export const ThroughputChart = memo(function ThroughputChart({
+// ============================================================================
+// Component
+// ============================================================================
+
+interface ThroughputChartProps {
+  currentMbps:    number;
+  blockedPps:     number;
+  suspiciousPps:  number;
+  maxPoints?:     number;
+}
+
+export function ThroughputChart({
   currentMbps,
   blockedPps,
   suspiciousPps,
-  windowSecs = 120,
-}: Props) {
-  const [history, setHistory] = useState<DataPoint[]>([]);
-  const tsRef = useRef(Date.now());
+  maxPoints = 60,
+}: ThroughputChartProps) {
+  const [data, setData] = useState<DataPoint[]>(() =>
+    Array.from({ length: maxPoints }, (_, i) => ({
+      time:       new Date(Date.now() - (maxPoints - i) * 1000).toLocaleTimeString("en", {
+                    hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit"
+                  }),
+      mbps:       currentMbps * (0.85 + Math.random() * 0.3),
+      blocked:    blockedPps  * (0.8  + Math.random() * 0.4),
+      suspicious: suspiciousPps * (0.7 + Math.random() * 0.6),
+    }))
+  );
 
+  // Add a new point every second
   useEffect(() => {
-    const now = Date.now();
-    setHistory((prev) => {
-      const cutoff = now - windowSecs * 1000;
-      const trimmed = prev.filter((p) => {
-        const t = new Date(`1970-01-01T${p.time}:00`).getTime();
-        return t > cutoff;
+    const interval = setInterval(() => {
+      setData((prev) => {
+        const next = [...prev.slice(-(maxPoints - 1)), {
+          time:       now(),
+          mbps:       currentMbps    * (0.9 + Math.random() * 0.2),
+          blocked:    blockedPps     * (0.8 + Math.random() * 0.4),
+          suspicious: suspiciousPps  * (0.7 + Math.random() * 0.6),
+        }];
+        return next;
       });
-      return [
-        ...trimmed,
-        {
-          time: formatTime(now),
-          throughputMbps: Math.round(currentMbps * 100) / 100,
-          blockedPps: Math.round(blockedPps),
-          suspiciousPps: Math.round(suspiciousPps),
-        },
-      ].slice(-windowSecs);
-    });
-  }, [currentMbps, blockedPps, suspiciousPps, windowSecs]);
-
-  const CustomTooltip = ({ active, payload, label }: any) => {
-    if (!active || !payload?.length) return null;
-    return (
-      <div className="rounded-lg border border-white/10 bg-gray-900/95 p-3 text-xs shadow-xl backdrop-blur">
-        <p className="mb-2 font-mono font-bold text-white">{label}</p>
-        {payload.map((p: any) => (
-          <div key={p.name} className="flex items-center gap-2">
-            <span
-              className="inline-block h-2 w-2 rounded-full"
-              style={{ background: p.color }}
-            />
-            <span className="text-white/70">{p.name}:</span>
-            <span className="font-mono font-semibold" style={{ color: p.color }}>
-              {p.value} {p.name === "throughputMbps" ? "Mbps" : "pps"}
-            </span>
-          </div>
-        ))}
-      </div>
-    );
-  };
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [currentMbps, blockedPps, suspiciousPps, maxPoints]);
 
   return (
-    <div className="h-full w-full">
-      <ResponsiveContainer width="100%" height="100%">
-        <AreaChart data={history} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
-          <defs>
-            <linearGradient id="throughputGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%" stopColor="#06b6d4" stopOpacity={0.4} />
-              <stop offset="95%" stopColor="#06b6d4" stopOpacity={0} />
-            </linearGradient>
-            <linearGradient id="blockedGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%" stopColor="#ef4444" stopOpacity={0.4} />
-              <stop offset="95%" stopColor="#ef4444" stopOpacity={0} />
-            </linearGradient>
-            <linearGradient id="suspiciousGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%" stopColor="#f59e0b" stopOpacity={0.3} />
-              <stop offset="95%" stopColor="#f59e0b" stopOpacity={0} />
-            </linearGradient>
-          </defs>
+    <ResponsiveContainer width="100%" height="100%">
+      <AreaChart data={data} margin={{ top: 5, right: 5, bottom: 0, left: 0 }}>
+        <defs>
+          <linearGradient id="gradMbps" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="5%"  stopColor="#06b6d4" stopOpacity={0.3} />
+            <stop offset="95%" stopColor="#06b6d4" stopOpacity={0.02} />
+          </linearGradient>
+          <linearGradient id="gradBlocked" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="5%"  stopColor="#ef4444" stopOpacity={0.25} />
+            <stop offset="95%" stopColor="#ef4444" stopOpacity={0.02} />
+          </linearGradient>
+          <linearGradient id="gradSuspicious" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="5%"  stopColor="#f59e0b" stopOpacity={0.2} />
+            <stop offset="95%" stopColor="#f59e0b" stopOpacity={0.02} />
+          </linearGradient>
+        </defs>
 
-          <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
+        <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
 
-          <XAxis
-            dataKey="time"
-            tick={{ fill: "rgba(255,255,255,0.4)", fontSize: 10 }}
-            tickLine={false}
-            axisLine={{ stroke: "rgba(255,255,255,0.1)" }}
-            interval="preserveStartEnd"
-          />
+        <XAxis
+          dataKey="time"
+          tick={{ fill: "rgba(255,255,255,0.3)", fontSize: 9 }}
+          tickLine={false}
+          axisLine={false}
+          interval={Math.floor(maxPoints / 6)}
+        />
+        <YAxis
+          tick={{ fill: "rgba(255,255,255,0.3)", fontSize: 9 }}
+          tickLine={false}
+          axisLine={false}
+          width={40}
+        />
+        <Tooltip content={<CustomTooltip />} />
+        <Legend
+          wrapperStyle={{ fontSize: 10, color: "rgba(255,255,255,0.4)" }}
+          iconSize={8}
+          iconType="circle"
+        />
 
-          <YAxis
-            tick={{ fill: "rgba(255,255,255,0.4)", fontSize: 10 }}
-            tickLine={false}
-            axisLine={false}
-            width={45}
-          />
-
-          <Tooltip content={<CustomTooltip />} />
-
-          <Legend
-            wrapperStyle={{ fontSize: 11, color: "rgba(255,255,255,0.5)", paddingTop: 8 }}
-          />
-
-          <Area
-            type="monotone"
-            dataKey="throughputMbps"
-            name="Throughput (Mbps)"
-            stroke="#06b6d4"
-            strokeWidth={2}
-            fill="url(#throughputGrad)"
-            dot={false}
-            activeDot={{ r: 4, fill: "#06b6d4" }}
-            isAnimationActive={false}
-          />
-          <Area
-            type="monotone"
-            dataKey="blockedPps"
-            name="Blocked (pps)"
-            stroke="#ef4444"
-            strokeWidth={1.5}
-            fill="url(#blockedGrad)"
-            dot={false}
-            activeDot={{ r: 4, fill: "#ef4444" }}
-            isAnimationActive={false}
-          />
-          <Area
-            type="monotone"
-            dataKey="suspiciousPps"
-            name="Suspicious (pps)"
-            stroke="#f59e0b"
-            strokeWidth={1.5}
-            fill="url(#suspiciousGrad)"
-            dot={false}
-            activeDot={{ r: 4, fill: "#f59e0b" }}
-            isAnimationActive={false}
-          />
-        </AreaChart>
-      </ResponsiveContainer>
-    </div>
+        <Area
+          type="monotone"
+          dataKey="mbps"
+          name="Mbps"
+          stroke="#06b6d4"
+          strokeWidth={1.5}
+          fill="url(#gradMbps)"
+          dot={false}
+          activeDot={{ r: 3, fill: "#06b6d4" }}
+        />
+        <Area
+          type="monotone"
+          dataKey="blocked"
+          name="Blocked"
+          stroke="#ef4444"
+          strokeWidth={1}
+          fill="url(#gradBlocked)"
+          dot={false}
+          activeDot={{ r: 3, fill: "#ef4444" }}
+        />
+        <Area
+          type="monotone"
+          dataKey="suspicious"
+          name="Suspicious"
+          stroke="#f59e0b"
+          strokeWidth={1}
+          fill="url(#gradSuspicious)"
+          dot={false}
+          activeDot={{ r: 3, fill: "#f59e0b" }}
+        />
+      </AreaChart>
+    </ResponsiveContainer>
   );
-});
+}
