@@ -7,64 +7,132 @@ name = "thor-agent"
 version = "1.0.0"
 edition = "2021"
 authors = ["Thor Security Team"]
-description = "Thor Firewall eBPF/XDP Agent — Real kernel-level packet filtering"
+description = "Thor Firewall eBPF/XDP Agent — Cilium conntrack + Katran jump tables + Tonic gRPC"
 license = "MIT"
+build = "build.rs"
 
 [[bin]]
 name = "thor-agent"
 path = "src/main.rs"
 
 [dependencies]
-# Async runtime
+# ── Async Runtime ─────────────────────────────────────────────────────────────
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["full"] }
+tokio-stream = "0.1"
 
-# eBPF userspace (Rust-native, no C required)
+# ── eBPF (Aya — Rust-native, مستوحى من https://github.com/aya-rs/aya) ─────────
 aya            = { version = "0.13", features = ["async_tokio"] }
 aya-log        = "0.2"
+aya-obj        = "0.2"
 
-# HTTP client for ML inference
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+# ── gRPC (Tonic — مستوحى من https://github.com/hyperium/tonic) ───────────────
+tonic = { version = "0.12", features = ["tls", "tls-roots", "gzip", "zstd"] }
+prost = "0.13"
+prost-types = "0.13"
 
-# Serialization
+# ── HTTP (Actix-web — مستوحى من https://github.com/actix/actix-web) ──────────
+# Note: actix-web used for internal metrics/health endpoints
+actix-web = { version = "4", features = ["rustls-0_23"] }
+actix-rt = "2"
+
+# ── HTTP Client ───────────────────────────────────────────────────────────────
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "gzip"], default-features = false }
+
+# ── Serialization ─────────────────────────────────────────────────────────────
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
+bincode    = "2"
 
-# CLI
+# ── Networking ────────────────────────────────────────────────────────────────
+pnet            = "0.35"
+pnet_datalink   = "0.35"
+etherparse      = "0.15"
+# WinDivert userspace capture (Windows — مستوحى من https://github.com/basil00/WinDivert)
+# windivert = "0.2"  # conditional on Windows target
+
+# ── Concurrency ───────────────────────────────────────────────────────────────
+dashmap    = "6"
+crossbeam  = "0.8"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+arc-swap   = "1"
+rayon      = "1"
+
+# ── Redis (State + BPF map sync) ─────────────────────────────────────────────
+redis = { version = "0.26", features = ["tokio-comp", "connection-manager", "cluster-async"] }
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive", "env"] }
 
-# Logging + tracing
+# ── Logging + Tracing ─────────────────────────────────────────────────────────
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.25"
+opentelemetry      = "0.24"
+opentelemetry-otlp = { version = "0.17", features = ["grpc-tonic"] }
+opentelemetry_sdk  = "0.24"
 
-# Metrics → Prometheus
-metrics                    = "0.22"
-metrics-exporter-prometheus = "0.13"
+# ── Metrics ───────────────────────────────────────────────────────────────────
+metrics                    = "0.23"
+metrics-exporter-prometheus = "0.15"
 
-# Error handling
+# ── Error Handling ────────────────────────────────────────────────────────────
 anyhow    = "1"
 thiserror = "1"
 
-# Utilities
-uuid      = { version = "1", features = ["v4"] }
-hostname  = "0.3"
-bytes     = "1"
-tokio-util = "0.7"
+# ── SIMD (PacketParser acceleration) ─────────────────────────────────────────
+packed_simd_2 = { version = "0.3", optional = true }
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+uuid       = { version = "1", features = ["v4"] }
+hostname   = "0.3"
+bytes      = "1"
+smallvec   = "1"
+tinyvec    = "1"
+itoa       = "1"
+ryu        = "1"
+ahash      = "0.8"
+lz4        = "1"
+zstd       = "0.13"
+memmap2    = "0.9"
+toml       = "0.8"
+config     = "0.14"
 
 [dev-dependencies]
-tokio-test = "0.4"
-mockall    = "0.12"
+tokio-test  = "0.4"
+mockall     = "0.13"
+criterion   = { version = "0.5", features = ["html_reports"] }
+proptest    = "1"
 
-# eBPF kernel program (compiled separately)
+[build-dependencies]
+tonic-build = { version = "0.12", features = ["prost"] }
+
+# eBPF kernel program compiled separately via xtask
 [package.metadata.ebpf]
-programs = ["src/ebpf/xdp_filter.bpf.rs"]
-target   = "bpfel-unknown-none"
+programs = [
+    "src/ebpf/xdp_filter.bpf.c",
+    "src/ebpf/conntrack.bpf.c",
+    "src/ebpf/katran_xdp.bpf.c",
+    "src/ebpf/tc_egress.bpf.c",
+]
+target = "bpfel-unknown-none"
+
+[[bench]]
+name = "packet_parser"
+harness = false
+
+[[bench]]
+name = "rule_engine"
+harness = false
 
 [profile.release]
 opt-level   = 3
-lto         = true
+lto         = "fat"
 codegen-units = 1
 strip       = true
 debug       = false
+panic       = "abort"
 
 [profile.dev]
 opt-level = 1

@@ -1,0 +1,63 @@
+# Thor Firewall — Loki Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# مستوحى من: https://grafana.com/oss/loki/
+# يجمع logs من كل خدمات Thor (structured JSON)
+# يتكامل مع Grafana لعرض logs مع Jaeger traces
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn
+
+common:
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 100
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+ruler:
+  alertmanager_url: http://alertmanager:9093
+  enable_api: true
+
+# Thor-specific retention
+limits_config:
+  retention_period: 720h   # 30 days
+  ingestion_rate_mb: 16
+  ingestion_burst_size_mb: 32
+  max_query_lookback: 720h
+  max_entries_limit_per_query: 50000
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+
+compactor:
+  working_directory: /loki/compactor
+  compaction_interval: 10m
+  retention_enabled: true
+  retention_delete_delay: 2h
+
+analytics:
+  reporting_enabled: false

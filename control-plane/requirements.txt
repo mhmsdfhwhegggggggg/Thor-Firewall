@@ -1,58 +1,87 @@
-# Thor Firewall — Control Plane Python Dependencies
+# Thor Firewall — Control Plane Requirements
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Web framework
+# ── Web Framework ─────────────────────────────────────────────────────────────
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
 python-multipart==0.0.18
 starlette==0.41.3
 httpx==0.27.2
+websockets==13.1
 
-# Auth
+# ── Auth — Keycloak OIDC + Casbin RBAC ───────────────────────────────────────
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 bcrypt==4.2.1
+# Casbin — RBAC/ABAC policy engine (مستوحى من https://github.com/casbin/casbin)
+casbin==1.36.3
+casbin-async-sqlalchemy-adapter==0.4.0
+# Keycloak OIDC client
+python-keycloak==4.2.2
+# JWT validation
+PyJWT[crypto]==2.9.0
 
-# Validation
+# ── Validation ────────────────────────────────────────────────────────────────
 pydantic==2.10.3
 pydantic-settings==2.6.1
 pydantic[email]==2.10.3
 email-validator==2.2.0
 
-# Database
+# ── Databases ─────────────────────────────────────────────────────────────────
 asyncpg==0.30.0
 sqlalchemy[asyncio]==2.0.36
 alembic==1.14.0
 psycopg2-binary==2.9.10
 
-# ClickHouse
+# ── ClickHouse (Flow Storage) ─────────────────────────────────────────────────
 clickhouse-driver==0.2.9
 clickhouse-connect==0.8.10
 
-# Redis
+# ── TimescaleDB (Metrics — time-series data) ──────────────────────────────────
+asyncpg==0.30.0    # reused for TimescaleDB connection
+
+# ── Redis (State + Cache + Pub/Sub) ──────────────────────────────────────────
 redis[asyncio]==5.2.1
 
-# ML serving client
+# ── ML Inference Client ───────────────────────────────────────────────────────
 onnxruntime==1.20.1
 numpy==2.2.0
+grpcio==1.68.0
+grpcio-tools==1.68.0
+protobuf==5.28.3
 
-# PDF generation
+# ── Threat Intel — MISP + Sigma ──────────────────────────────────────────────
+pymisp==2.4.196       # MISP Python API
+# Sigma rule engine (مستوحى من https://github.com/SigmaHQ/sigma)
+sigma-cli==1.0.4
+pysigma==0.11.15
+pysigma-backend-elasticsearch==1.1.0
+pysigma-pipeline-sysmon==1.4.0
+stix2==3.0.1          # STIX 2.1 Threat Intel format
+taxii2-client==2.3.0  # TAXII protocol client
+
+# ── PDF Generation (Compliance Reports) ──────────────────────────────────────
 weasyprint==62.3
 jinja2==3.1.4
 reportlab==4.2.5
 
-# Logging
+# ── Logging + Observability ───────────────────────────────────────────────────
 structlog==24.4.0
 python-json-logger==2.0.7
-
-# Metrics
-prometheus-client==0.21.1
 opentelemetry-api==1.29.0
 opentelemetry-sdk==1.29.0
 opentelemetry-instrumentation-fastapi==0.50b0
+opentelemetry-exporter-otlp==1.29.0
+opentelemetry-exporter-otlp-proto-grpc==1.29.0
+prometheus-client==0.21.1
 
-# Utilities
+# ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv==1.0.1
 tenacity==9.0.0
 orjson==3.10.12
 ujson==5.10.0
 anyio==4.7.0
+aiofiles==24.1.0
+cryptography==43.0.3
+hashids==1.3.1
+arrow==1.3.0

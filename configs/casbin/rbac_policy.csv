@@ -1,0 +1,51 @@
+# Thor Firewall — Casbin RBAC Policy
+# Format: p, role, domain, resource, action
+# Format: g, user, role, domain
+
+# ── Super Admin — كل الصلاحيات ─────────────────────────────────────────────
+p, super_admin, *, *, *
+
+# ── Admin ────────────────────────────────────────────────────────────────────
+p, admin, thor, /api/flows/*, *
+p, admin, thor, /api/threats/*, *
+p, admin, thor, /api/policies/*, *
+p, admin, thor, /api/rules/*, *
+p, admin, thor, /api/users/*, *
+p, admin, thor, /api/ml/*, read
+p, admin, thor, /api/intel/*, *
+p, admin, thor, /api/reports/*, *
+p, admin, thor, /api/audit/*, read
+p, admin, thor, /api/compliance/*, *
+p, admin, thor, /api/agents/*, *
+
+# ── Analyst — تحليل + قراءة + تحديث التهديدات ───────────────────────────────
+p, analyst, thor, /api/flows/*, read
+p, analyst, thor, /api/threats/*, *
+p, analyst, thor, /api/intel/*, *
+p, analyst, thor, /api/rules/*, read
+p, analyst, thor, /api/reports/*, read
+p, analyst, thor, /api/audit/*, read
+p, analyst, thor, /api/ml/infer, write
+p, analyst, thor, /api/soar/*, write
+p, analyst, thor, /api/cases/*, *
+p, analyst, thor, /api/hunting/*, *
+
+# ── Viewer — قراءة فقط ───────────────────────────────────────────────────────
+p, viewer, thor, /api/flows/*, read
+p, viewer, thor, /api/threats/*, read
+p, viewer, thor, /api/reports/*, read
+p, viewer, thor, /api/compliance/*, read
+p, viewer, thor, /api/dashboard/*, read
+
+# ── Agent — الوكيل (thor-agent Rust binary) ──────────────────────────────────
+p, agent, thor, /api/flows/report, write
+p, agent, thor, /api/ml/infer, write
+p, agent, thor, /api/rules/current, read
+p, agent, thor, /api/intel/check, read
+p, agent, thor, /api/health, read
+
+# ── Role assignments (examples — يُحدَّث من Keycloak) ──────────────────────
+g, admin@thor.local,   admin,       thor
+g, analyst@thor.local, analyst,     thor
+g, viewer@thor.local,  viewer,      thor
+g, agent-001,          agent,       thor

@@ -1,0 +1,246 @@
+# Thor Firewall — Sigma Rules: Network Threats
+# ─────────────────────────────────────────────────────────────────────────────
+# مستوحى من: https://github.com/SigmaHQ/sigma
+# يُطابق: network flows التي تمر عبر Thor XDP pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+---
+id: thor-net-001
+title: SYN Flood DDoS Attack
+status: stable
+description: >
+  اكتشاف هجوم SYN Flood — عدد كبير من TCP SYN بدون SYN-ACK response.
+  يشير إلى DDoS أو port scanning.
+author: Thor Security Team
+date: 2024-01-01
+tags:
+  - attack.impact
+  - attack.t1498
+  - attack.network_denial_of_service
+level: high
+logsource:
+  category: network_flow
+  product: thor_firewall
+detection:
+  selection:
+    protocol: tcp
+    tcp_flags|contains: "SYN"
+    pps|gte: 10000
+  filter:
+    tcp_flags|contains: "ACK"
+  condition: selection and not filter
+fields:
+  - src_ip
+  - dst_ip
+  - pps
+  - packets
+falsepositives:
+  - Legitimate high-traffic servers
+  - Load balancers
+
+---
+id: thor-net-002
+title: Port Scan Detection
+status: stable
+description: >
+  اكتشاف port scan — IP واحد يحاول الاتصال بمنافذ متعددة في فترة قصيرة.
+author: Thor Security Team
+date: 2024-01-01
+tags:
+  - attack.reconnaissance
+  - attack.t1046
+level: medium
+logsource:
+  category: network_flow
+  product: thor_firewall
+detection:
+  selection:
+    unique_dst_ports|gte: 50
+    duration_secs|lte: 60
+    protocol: tcp
+  condition: selection
+fields:
+  - src_ip
+  - unique_dst_ports
+  - duration_secs
+falsepositives:
+  - Network scanners (authorized)
+  - Vulnerability scanners (Nessus, Qualys)
+
+---
+id: thor-net-003
+title: DNS Tunneling Detection
+status: stable
+description: >
+  اكتشاف DNS tunneling — حجم بيانات كبير عبر DNS queries.
+  يُستخدم لتسريب البيانات أو C2 communication.
+author: Thor Security Team
+date: 2024-01-01
+tags:
+  - attack.exfiltration
+  - attack.t1048.001
+  - attack.command_and_control
+  - attack.t1071.004
+level: high
+logsource:
+  category: network_flow
+  product: thor_firewall
+detection:
+  selection:
+    dst_port: 53
+    bytes|gte: 50000
+  filter_low:
+    bytes|lte: 1000
+  condition: selection and not filter_low
+fields:
+  - src_ip
+  - dst_ip
+  - bytes
+  - query_count
+
+---
+id: thor-net-004
+title: C2 Beaconing Pattern
+status: stable
+description: >
+  اكتشاف نمط beaconing — اتصالات منتظمة الفترة مع IP خارجي.
+  يُشير إلى malware C2 communication.
+author: Thor Security Team
+date: 2024-01-01
+tags:
+  - attack.command_and_control
+  - attack.t1071
+  - attack.t1095
+level: critical
+logsource:
+  category: network_flow
+  product: thor_firewall
+detection:
+  selection:
+    connection_regularity|gte: 0.85
+    external_ip: true
+    duration_hours|gte: 1
+    payload_entropy|lte: 0.3
+  condition: selection
+fields:
+  - src_ip
+  - dst_ip
+  - connection_regularity
+  - payload_entropy
+
+---
+id: thor-net-005
+title: Lateral Movement — SMB Scanning
+status: stable
+description: >
+  اكتشاف lateral movement عبر SMB — scanning للـ 445 داخل الشبكة.
+author: Thor Security Team
+date: 2024-01-01
+tags:
+  - attack.lateral_movement
+  - attack.t1021.002
+level: high
+logsource:
+  category: network_flow
+  product: thor_firewall
+detection:
+  selection:
+    dst_port: 445
+    direction: internal
+    unique_dst_ips|gte: 10
+    duration_secs|lte: 300
+  condition: selection
+fields:
+  - src_ip
+  - unique_dst_ips
+  - dst_port
+
+---
+id: thor-net-006
+title: Data Exfiltration — Large Upload to External
+status: stable
+description: >
+  اكتشاف تسريب بيانات — حجم كبير من البيانات ترسل إلى IP خارجي.
+author: Thor Security Team
+date: 2024-01-01
+tags:
+  - attack.exfiltration
+  - attack.t1041
+level: critical
+logsource:
+  category: network_flow
+  product: thor_firewall
+detection:
+  selection:
+    bytes_sent|gte: 100000000
+    direction: outbound
+    external_ip: true
+  filter_known:
+    dst_ip|cidr:
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+      - "192.168.0.0/16"
+  condition: selection and not filter_known
+fields:
+  - src_ip
+  - dst_ip
+  - bytes_sent
+  - protocol
+
+---
+id: thor-net-007
+title: Tor Exit Node Connection
+status: stable
+description: >
+  اكتشاف اتصال بـ Tor exit node — يُشير إلى محاولة إخفاء الهوية.
+author: Thor Security Team
+date: 2024-01-01
+tags:
+  - attack.defense_evasion
+  - attack.t1090.003
+level: medium
+logsource:
+  category: network_flow
+  product: thor_firewall
+detection:
+  selection:
+    is_tor_exit: true
+  condition: selection
+fields:
+  - src_ip
+  - dst_ip
+  - is_tor_exit
+
+---
+id: thor-net-008
+title: High Entropy Payload — Possible Encryption/Obfuscation
+status: stable
+description: >
+  حمولة عالية entropy يُشير إلى تشفير أو obfuscation.
+  قد يكون ransomware أو tunneling.
+author: Thor Security Team
+date: 2024-01-01
+tags:
+  - attack.command_and_control
+  - attack.defense_evasion
+  - attack.t1573
+level: medium
+logsource:
+  category: network_flow
+  product: thor_firewall
+detection:
+  selection:
+    payload_entropy|gte: 0.95
+    bytes|gte: 10000
+  filter_known_encrypted:
+    dst_port:
+      - 443
+      - 8443
+      - 993
+      - 995
+  condition: selection and not filter_known_encrypted
+fields:
+  - src_ip
+  - dst_ip
+  - payload_entropy
+  - dst_port

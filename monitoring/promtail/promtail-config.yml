@@ -1,0 +1,85 @@
+# Thor Firewall — Promtail Configuration (Log Shipper → Loki)
+# ─────────────────────────────────────────────────────────────────────────────
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  # ── Thor Control Plane Logs ─────────────────────────────────────────────────
+  - job_name: thor-control-plane
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+        filters:
+          - name: name
+            values: ["thor-control-plane"]
+    relabel_configs:
+      - source_labels: ['__meta_docker_container_name']
+        target_label: service
+      - replacement: thor-control-plane
+        target_label: service
+    pipeline_stages:
+      - json:
+          expressions:
+            level:   level
+            message: message
+            event:   event
+      - labels:
+          level:
+          event:
+      - output:
+          source: message
+
+  # ── Thor ML Inference Logs ──────────────────────────────────────────────────
+  - job_name: thor-ml
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        filters:
+          - name: name
+            values: ["thor-ml-inference", "thor-bentoml"]
+    relabel_configs:
+      - source_labels: ['__meta_docker_container_name']
+        target_label: service
+    pipeline_stages:
+      - json:
+          expressions:
+            level: level
+      - labels:
+          level:
+
+  # ── Thor Agent Logs (from /var/log/thor/) ──────────────────────────────────
+  - job_name: thor-agent
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: thor-agent
+          service: thor-agent
+          __path__: /var/log/thor/agent.log
+    pipeline_stages:
+      - json:
+          expressions:
+            level:   level
+            message: message
+      - labels:
+          level:
+
+  # ── System Logs ──────────────────────────────────────────────────────────────
+  - job_name: system
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: system
+          __path__: /var/log/syslog
+    pipeline_stages:
+      - regex:
+          expression: '(?P<timestamp>\S+ \S+) (?P<host>\S+) (?P<service>\S+)\[(?P<pid>\d+)\]: (?P<message>.*)'
+      - labels:
+          host:
+          service:

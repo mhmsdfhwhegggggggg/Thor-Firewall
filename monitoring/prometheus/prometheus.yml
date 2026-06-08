@@ -1,9 +1,14 @@
 # Thor Firewall — Prometheus Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# يجمع metrics من: Thor Agent + Control Plane + ClickHouse + Redis + Keycloak
+#                   BentoML + TimescaleDB + ML Inference
+# ─────────────────────────────────────────────────────────────────────────────
+
 global:
-  scrape_interval: 15s
+  scrape_interval:     15s
   evaluation_interval: 15s
   external_labels:
-    cluster: 'thor-production'
+    cluster:     'thor-production'
     environment: 'production'
 
 rule_files:
@@ -16,31 +21,68 @@ alerting:
         - targets: ['alertmanager:9093']
 
 scrape_configs:
+
+  # ── Thor Agent (Rust binary — eBPF/XDP metrics) ────────────────────────────
   - job_name: 'thor-agent'
+    scrape_interval: 5s
     static_configs:
       - targets: ['thor-agent:9100']
     relabel_configs:
       - source_labels: [__address__]
         target_label: instance
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'thor_agent_.*'
+        action: keep
 
+  # ── Control Plane (FastAPI + Casbin + Sigma) ───────────────────────────────
   - job_name: 'thor-control-plane'
     metrics_path: '/api/metrics'
     static_configs:
       - targets: ['control-plane:8000']
 
+  # ── ML Inference ──────────────────────────────────────────────────────────
   - job_name: 'thor-ml-inference'
     metrics_path: '/metrics'
     static_configs:
       - targets: ['ml-inference:8082']
 
+  # ── BentoML (Model Serving) ────────────────────────────────────────────────
+  - job_name: 'thor-bentoml'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['bentoml:3000']
+
+  # ── ClickHouse ─────────────────────────────────────────────────────────────
   - job_name: 'clickhouse'
     static_configs:
       - targets: ['clickhouse:9363']
 
+  # ── Redis ─────────────────────────────────────────────────────────────────
   - job_name: 'redis'
     static_configs:
       - targets: ['redis-exporter:9121']
 
+  # ── Keycloak (IAM metrics) ─────────────────────────────────────────────────
+  - job_name: 'keycloak'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['keycloak:8080']
+    params:
+      module: [http_2xx]
+
+  # ── TimescaleDB (via postgres_exporter) ───────────────────────────────────
+  - job_name: 'timescaledb'
+    static_configs:
+      - targets: ['timescaledb:9187']
+
+  # ── MLflow ────────────────────────────────────────────────────────────────
+  - job_name: 'mlflow'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['mlflow:5000']
+
+  # ── Kubernetes pod autodiscovery (Production) ─────────────────────────────
   - job_name: 'kubernetes-pods'
     kubernetes_sd_configs:
       - role: pod
@@ -50,3 +92,18 @@ scrape_configs:
       - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
         action: keep
         regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: pod
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: namespace

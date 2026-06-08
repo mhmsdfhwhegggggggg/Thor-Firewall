@@ -1,0 +1,158 @@
+{
+  "realm": "thor",
+  "displayName": "Thor Firewall",
+  "displayNameHtml": "<div class='kc-logo-text'><span>Thor Firewall</span></div>",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": true,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": true,
+  "permanentLockout": false,
+  "maxFailureWaitSeconds": 900,
+  "minimumQuickLoginWaitSeconds": 60,
+  "waitIncrementSeconds": 60,
+  "quickLoginCheckMilliSeconds": 1000,
+  "maxDeltaTimeSeconds": 43200,
+  "failureFactor": 5,
+  "defaultRoles": ["analyst"],
+  "requiredCredentials": ["password"],
+  "passwordPolicy": "length(12) and upperCase(1) and lowerCase(1) and digits(1) and specialChars(1) and notUsername(undefined) and passwordHistory(5)",
+  "otpPolicyType": "totp",
+  "otpPolicyAlgorithm": "HmacSHA1",
+  "otpPolicyInitialCounter": 0,
+  "otpPolicyDigits": 6,
+  "otpPolicyLookAheadWindow": 1,
+  "otpPolicyPeriod": 30,
+  "clients": [
+    {
+      "clientId": "thor-dashboard",
+      "name": "Thor SOC Dashboard",
+      "description": "Thor Firewall SOC Dashboard (React)",
+      "enabled": true,
+      "publicClient": true,
+      "protocol": "openid-connect",
+      "redirectUris": ["http://localhost:3000/*", "http://localhost:3002/*", "https://*.thor.io/*"],
+      "webOrigins": ["http://localhost:3000", "http://localhost:3002", "https://*.thor.io"],
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "attributes": {
+        "post.logout.redirect.uris": "+"
+      },
+      "defaultClientScopes": ["web-origins", "acr", "profile", "roles", "email"],
+      "optionalClientScopes": ["address", "phone", "offline_access", "microprofile-jwt"]
+    },
+    {
+      "clientId": "thor-api",
+      "name": "Thor Control Plane API",
+      "description": "Thor Firewall FastAPI backend",
+      "enabled": true,
+      "publicClient": false,
+      "bearerOnly": false,
+      "protocol": "openid-connect",
+      "secret": "${KEYCLOAK_CLIENT_SECRET}",
+      "redirectUris": ["http://localhost:8000/*"],
+      "webOrigins": ["http://localhost:8000"],
+      "standardFlowEnabled": true,
+      "serviceAccountsEnabled": true,
+      "authorizationServicesEnabled": true
+    },
+    {
+      "clientId": "grafana",
+      "name": "Grafana",
+      "enabled": true,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "secret": "${GRAFANA_OIDC_SECRET}",
+      "redirectUris": ["http://localhost:3001/*"],
+      "webOrigins": ["http://localhost:3001"],
+      "standardFlowEnabled": true
+    },
+    {
+      "clientId": "thor-agent",
+      "name": "Thor Agent (Rust binary)",
+      "enabled": true,
+      "publicClient": false,
+      "bearerOnly": false,
+      "protocol": "openid-connect",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": true
+    }
+  ],
+  "roles": {
+    "realm": [
+      {
+        "name": "super_admin",
+        "description": "Full system access — IT Security Director"
+      },
+      {
+        "name": "admin",
+        "description": "System administration — Security Manager"
+      },
+      {
+        "name": "analyst",
+        "description": "SOC Analyst — threat investigation and response"
+      },
+      {
+        "name": "viewer",
+        "description": "Read-only access — Security Auditor"
+      },
+      {
+        "name": "agent",
+        "description": "Thor Agent service account"
+      }
+    ]
+  },
+  "users": [
+    {
+      "username": "thor-admin",
+      "email": "admin@thor.local",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Thor",
+      "lastName": "Admin",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "ThorAdmin2024!",
+          "temporary": true
+        }
+      ],
+      "realmRoles": ["super_admin", "admin"]
+    },
+    {
+      "username": "soc-analyst",
+      "email": "analyst@thor.local",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "SOC",
+      "lastName": "Analyst",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "SocAnalyst2024!",
+          "temporary": true
+        }
+      ],
+      "realmRoles": ["analyst"]
+    }
+  ],
+  "defaultTokenLifespan": 300,
+  "accessTokenLifespan": 300,
+  "accessTokenLifespanForImplicitFlow": 900,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "eventsEnabled": true,
+  "eventsListeners": ["jboss-logging"],
+  "enabledEventTypes": [
+    "LOGIN", "LOGIN_ERROR", "LOGOUT", "REGISTER",
+    "UPDATE_PASSWORD", "UPDATE_TOTP",
+    "CLIENT_LOGIN", "CLIENT_LOGIN_ERROR"
+  ],
+  "adminEventsEnabled": true,
+  "adminEventsDetailsEnabled": true
+}

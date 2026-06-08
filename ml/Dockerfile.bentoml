@@ -1,0 +1,45 @@
+# Thor Firewall — BentoML Serving Container
+# ─────────────────────────────────────────────────────────────────────────────
+# يخدم: MARL models + GNN embeddings + UEBA
+# مستوحى من: https://github.com/bentoml/BentoML
+# ─────────────────────────────────────────────────────────────────────────────
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install ML requirements (CPU-only torch for inference)
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir \
+    torch==2.3.0+cpu \
+    --extra-index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir \
+    bentoml>=1.3.4 \
+    torch-geometric>=2.5.3 \
+    scikit-learn>=1.5.0 \
+    numpy>=1.26.0 \
+    redis[asyncio]>=5.0.0 \
+    mlflow-skinny>=2.14.0 \
+    prometheus-client>=0.20.0 \
+    opentelemetry-api>=1.25.0 \
+    opentelemetry-sdk>=1.25.0 \
+    pydantic>=2.8.0 \
+    httpx>=0.27.0
+
+COPY . /app/ml
+COPY serving/bentoml_service.py /app/service.py
+COPY gnn/pyg_model.py /app/gnn_model.py
+
+EXPOSE 3000 50051
+
+ENV BENTOML_PORT=3000
+ENV DEVICE=cpu
+
+CMD ["bentoml", "serve", "service:svc", "--host", "0.0.0.0", "--port", "3000", "--reload"]

@@ -1,26 +1,53 @@
 {
   "name": "thor-dashboard",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "scripts": {
     "dev": "vite --host",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --ext ts,tsx"
   },
   "dependencies": {
-    "lucide-react": "^0.441.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "recharts": "^2.12.7"
+    "react-router-dom": "^6.26.2",
+    "lucide-react": "^0.441.0",
+    "recharts": "^2.12.7",
+
+    "cytoscape": "^3.30.2",
+    "cytoscape-cola": "^2.5.1",
+    "cytoscape-cosebilkent": "^4.1.0",
+    "cytoscape-dagre": "^2.5.0",
+    "cytoscape-fcose": "^2.2.0",
+    "react-cytoscapejs": "^2.0.0",
+
+    "@keycloak/keycloak-js": "^25.0.2",
+
+    "d3": "^7.9.0",
+    "@types/d3": "^7.4.3",
+
+    "zustand": "^4.5.5",
+    "@tanstack/react-query": "^5.55.4",
+    "axios": "^1.7.5",
+
+    "date-fns": "^3.6.0",
+    "clsx": "^2.1.1",
+    "tailwind-merge": "^2.5.2"
   },
   "devDependencies": {
     "@types/react": "^18.3.5",
     "@types/react-dom": "^18.3.0",
+    "@types/cytoscape": "^3.21.7",
     "@vitejs/plugin-react": "^4.3.1",
     "autoprefixer": "^10.4.20",
     "postcss": "^8.4.45",
     "tailwindcss": "^3.4.11",
     "typescript": "^5.5.3",
-    "vite": "^5.4.2"
+    "vite": "^5.4.2",
+    "eslint": "^9.9.0",
+    "@typescript-eslint/eslint-plugin": "^8.3.0",
+    "@typescript-eslint/parser": "^8.3.0"
   }
 }

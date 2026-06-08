@@ -1,30 +1,54 @@
-# Thor Firewall — Docker Compose (Development + Local Testing)
+# Thor Firewall — Docker Compose (Full Integration Stack)
+# ─────────────────────────────────────────────────────────────────────────────
+# يضم: ClickHouse + Redis + TimescaleDB + MLflow + Keycloak
+#       Loki + Jaeger + Prometheus + Grafana + MISP + BentoML + vLLM
 # الاستخدام: make dev  أو  docker compose up -d
+# الاستخدام مع LLM: docker compose --profile inference up -d
+# ─────────────────────────────────────────────────────────────────────────────
 
 version: "3.9"
 
 networks:
   thor-net:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+  thor-ml-net:
+    driver: bridge
+  thor-obs-net:
+    driver: bridge
 
 volumes:
   clickhouse_data:
   redis_data:
+  timescaledb_data:
   mlflow_data:
   ml_models:
   grafana_data:
   prometheus_data:
+  loki_data:
+  jaeger_data:
+  keycloak_data:
+  misp_data:
+  misp_mysql_data:
+  bentoml_models:
 
 services:
 
-  # ── ClickHouse (Event Storage + Analytics) ─────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# DATABASES — ClickHouse + Redis + TimescaleDB
+# ─────────────────────────────────────────────────────────────────────────────
+
+  # ── ClickHouse (Flow Storage + Analytics — مستوحى من Cilium Hubble) ─────────
   clickhouse:
     image: clickhouse/clickhouse-server:24.3
     container_name: thor-clickhouse
     restart: unless-stopped
     ports:
-      - "8123:8123"   # HTTP
-      - "9000:9000"   # Native
+      - "8123:8123"    # HTTP
+      - "9000:9000"    # Native
+      - "9363:9363"    # Prometheus metrics
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - ./configs/clickhouse:/docker-entrypoint-initdb.d
@@ -33,6 +57,10 @@ services:
       CLICKHOUSE_USER: thor
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
       CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:-thor_dev_password}"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
     healthcheck:
       test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
       interval: 10s
@@ -41,7 +69,7 @@ services:
     networks:
       - thor-net
 
-  # ── Redis (Cache + Message Queue) ──────────────────────────────────────────
+  # ── Redis (State + Cache + Pub/Sub — BPF map sync + flow table TTL) ─────────
   redis:
     image: redis:7.2-alpine
     container_name: thor-redis
@@ -50,7 +78,13 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 1gb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+      --hz 100
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -59,9 +93,110 @@ services:
     networks:
       - thor-net
 
-  # ── MLflow (Experiment Tracking) ────────────────────────────────────────────
+  # ── Redis Exporter ───────────────────────────────────────────────────────────
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    container_name: thor-redis-exporter
+    restart: unless-stopped
+    ports:
+      - "9121:9121"
+    environment:
+      REDIS_ADDR: "redis://redis:6379"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - thor-net
+      - thor-obs-net
+
+  # ── TimescaleDB (Time-Series Metrics — Agent + System performance data) ──────
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: thor-timescaledb
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./configs/timescaledb/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    environment:
+      POSTGRES_DB: thor_metrics
+      POSTGRES_USER: thor
+      POSTGRES_PASSWORD: "${TIMESCALEDB_PASSWORD:-thor_ts_dev_password}"
+      TIMESCALEDB_TELEMETRY: "off"
+    command: postgres -c shared_preload_libraries=timescaledb
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "thor", "-d", "thor_metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - thor-net
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTH & IDENTITY — Keycloak (JWT/OIDC/SAML) + Casbin (RBAC)
+# ─────────────────────────────────────────────────────────────────────────────
+
+  keycloak-db:
+    image: postgres:16-alpine
+    container_name: thor-keycloak-db
+    restart: unless-stopped
+    volumes:
+      - keycloak_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: "${KEYCLOAK_DB_PASSWORD:-keycloak_dev_pass}"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "keycloak"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - thor-net
+
+  # ── Keycloak (IAM — JWT, OIDC, SAML, MFA) ──────────────────────────────────
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    container_name: thor-keycloak
+    restart: unless-stopped
+    ports:
+      - "8180:8080"
+    volumes:
+      - ./configs/keycloak/thor-realm.json:/opt/keycloak/data/import/thor-realm.json:ro
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: "jdbc:postgresql://keycloak-db:5432/keycloak"
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: "${KEYCLOAK_DB_PASSWORD:-keycloak_dev_pass}"
+      KC_HOSTNAME: "${KEYCLOAK_HOSTNAME:-localhost}"
+      KC_HOSTNAME_PORT: "8180"
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: "${KEYCLOAK_ADMIN_PASSWORD:-Admin2024!}"
+      KC_METRICS_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+    command: start-dev --import-realm
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health/ready | grep -q UP || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    networks:
+      - thor-net
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ML PLATFORM — MLflow + BentoML + Ray + vLLM
+# ─────────────────────────────────────────────────────────────────────────────
+
+  # ── MLflow (Experiment Tracking + Model Registry) ────────────────────────────
   mlflow:
-    image: ghcr.io/mlflow/mlflow:2.11.0
+    image: ghcr.io/mlflow/mlflow:2.13.0
     container_name: thor-mlflow
     restart: unless-stopped
     ports:
@@ -76,16 +211,80 @@ services:
       mlflow server
       --backend-store-uri sqlite:////mlflow/mlflow.db
       --default-artifact-root /mlflow/artifacts
-      --host 0.0.0.0 --port 5000
+      --host 0.0.0.0
+      --port 5000
+      --workers 4
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 30s
       timeout: 10s
-      retries: 3
+      retries: 5
     networks:
       - thor-net
+      - thor-ml-net
 
-  # ── ML Inference Server ─────────────────────────────────────────────────────
+  # ── BentoML (Model Serving — MARL + GNN + UEBA inference) ──────────────────
+  bentoml:
+    build:
+      context: ./ml
+      dockerfile: Dockerfile.bentoml
+    container_name: thor-bentoml
+    restart: unless-stopped
+    ports:
+      - "3000:3000"    # HTTP REST
+      - "50055:50051"  # gRPC (Tonic client connects here)
+    volumes:
+      - bentoml_models:/home/bentoml/bentoml/bentos
+      - ml_models:/models:ro
+    environment:
+      MLFLOW_TRACKING_URI: "http://mlflow:5000"
+      BENTOML_PORT: "3000"
+      MODEL_PATH: "/models"
+      REDIS_URL: "redis://redis:6379/1"
+      DEVICE: "${ML_DEVICE:-cpu}"
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - thor-net
+      - thor-ml-net
+
+  # ── vLLM (LLM Inference — Mistral-7B Explainer — GPU optional) ──────────────
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: thor-vllm
+    restart: unless-stopped
+    profiles: ["inference"]
+    ports:
+      - "8001:8000"
+    volumes:
+      - ml_models:/models
+    environment:
+      MODEL: "${VLLM_MODEL:-mistralai/Mistral-7B-Instruct-v0.2}"
+    command: >
+      python -m vllm.entrypoints.openai.api_server
+      --model ${VLLM_MODEL:-mistralai/Mistral-7B-Instruct-v0.2}
+      --host 0.0.0.0
+      --port 8000
+      --max-model-len 8192
+      --quantization ${VLLM_QUANTIZATION:-awq}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 120s
+    networks:
+      - thor-ml-net
+
+  # ── ML Inference (Core — CPU MARL/GNN serving) ───────────────────────────────
   ml-inference:
     build:
       context: ./ml
@@ -99,9 +298,11 @@ services:
     environment:
       MODEL_PATH: /models/thor_marl_best.pt
       MLFLOW_TRACKING_URI: http://mlflow:5000
-      DEVICE: cpu
-      BATCH_SIZE: "256"
+      DEVICE: "${ML_DEVICE:-cpu}"
+      BATCH_SIZE: "${ML_BATCH_SIZE:-256}"
       PORT: "8082"
+      BENTOML_URL: "http://bentoml:3000"
+      VLLM_URL: "http://vllm:8000/v1"
     depends_on:
       mlflow:
         condition: service_healthy
@@ -112,8 +313,67 @@ services:
       retries: 5
     networks:
       - thor-net
+      - thor-ml-net
 
-  # ── Control Plane (API Server) ───────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# THREAT INTELLIGENCE — MISP (IoC Database)
+# ─────────────────────────────────────────────────────────────────────────────
+
+  misp-db:
+    image: mariadb:10.11
+    container_name: thor-misp-db
+    restart: unless-stopped
+    volumes:
+      - misp_mysql_data:/var/lib/mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: "${MISP_DB_ROOT_PASSWORD:-misp_root_dev}"
+      MYSQL_DATABASE: misp
+      MYSQL_USER: misp
+      MYSQL_PASSWORD: "${MISP_DB_PASSWORD:-misp_dev_password}"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-u", "root", "-pmisp_root_dev"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - thor-net
+
+  # ── MISP (Malware Information Sharing Platform) ──────────────────────────────
+  misp:
+    image: ghcr.io/misp/misp-docker/misp-core:latest
+    container_name: thor-misp
+    restart: unless-stopped
+    profiles: ["full"]
+    ports:
+      - "8081:80"
+    volumes:
+      - misp_data:/var/www/MISP/app/files
+    environment:
+      MISP_BASEURL: "http://localhost:8081"
+      MYSQL_HOST: misp-db
+      MYSQL_DATABASE: misp
+      MYSQL_USER: misp
+      MYSQL_PASSWORD: "${MISP_DB_PASSWORD:-misp_dev_password}"
+      MISP_ADMIN_EMAIL: "${MISP_ADMIN_EMAIL:-admin@thor.local}"
+      MISP_ADMIN_PASSWORD: "${MISP_ADMIN_PASSWORD:-MispAdmin2024!}"
+      MISP_ORG: "Thor Security"
+    depends_on:
+      misp-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/users/login"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - thor-net
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CORE APP — Control Plane + Dashboard
+# ─────────────────────────────────────────────────────────────────────────────
+
+  # ── Control Plane (FastAPI + Casbin RBAC + Sigma + SOAR) ────────────────────
   control-plane:
     build:
       context: ./control-plane
@@ -125,17 +385,34 @@ services:
     environment:
       CLICKHOUSE_URL: "clickhouse://thor:${CLICKHOUSE_PASSWORD:-thor_dev_password}@clickhouse:9000/thor"
       REDIS_URL: "redis://redis:6379/0"
+      TIMESCALEDB_URL: "postgresql+asyncpg://thor:${TIMESCALEDB_PASSWORD:-thor_ts_dev_password}@timescaledb:5432/thor_metrics"
       ML_INFERENCE_URL: "http://ml-inference:8082"
+      BENTOML_URL: "http://bentoml:3000"
+      VLLM_URL: "http://vllm:8000/v1"
       MLFLOW_TRACKING_URI: "http://mlflow:5000"
+      MISP_URL: "http://misp:80"
+      MISP_AUTH_KEY: "${MISP_AUTH_KEY:-}"
+      KEYCLOAK_URL: "http://keycloak:8080"
+      KEYCLOAK_REALM: "thor"
+      KEYCLOAK_CLIENT_ID: "thor-api"
+      KEYCLOAK_CLIENT_SECRET: "${KEYCLOAK_CLIENT_SECRET:-}"
       JWT_SECRET: "${JWT_SECRET:-dev_secret_change_in_prod}"
       AUDIT_HMAC_SECRET: "${AUDIT_HMAC_SECRET:-hmac_dev_change_in_prod_32b!!}"
-      ENVIRONMENT: "development"
+      SIGMA_RULES_DIR: "/app/configs/sigma"
+      CASBIN_MODEL_PATH: "/app/configs/casbin/rbac_model.conf"
+      CASBIN_POLICY_PATH: "/app/configs/casbin/rbac_policy.csv"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
+      OTEL_SERVICE_NAME: "thor-control-plane"
+      ENVIRONMENT: "${ENVIRONMENT:-development}"
+    volumes:
+      - ./configs/sigma:/app/configs/sigma:ro
+      - ./configs/casbin:/app/configs/casbin:ro
     depends_on:
       clickhouse:
         condition: service_healthy
       redis:
         condition: service_healthy
-      ml-inference:
+      timescaledb:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
@@ -144,45 +421,9 @@ services:
       retries: 5
     networks:
       - thor-net
+      - thor-obs-net
 
-  # ── Prometheus ───────────────────────────────────────────────────────────────
-  prometheus:
-    image: prom/prometheus:v2.51.0
-    container_name: thor-prometheus
-    restart: unless-stopped
-    ports:
-      - "9090:9090"
-    volumes:
-      - prometheus_data:/prometheus
-      - ./monitoring/prometheus:/etc/prometheus
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      - "--storage.tsdb.retention.time=30d"
-      - "--web.enable-lifecycle"
-    networks:
-      - thor-net
-
-  # ── Grafana ──────────────────────────────────────────────────────────────────
-  grafana:
-    image: grafana/grafana:10.4.1
-    container_name: thor-grafana
-    restart: unless-stopped
-    ports:
-      - "3001:3000"
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
-      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning/datasources
-    environment:
-      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:-admin}"
-      GF_USERS_ALLOW_SIGN_UP: "false"
-    depends_on:
-      - prometheus
-    networks:
-      - thor-net
-
-  # ── Dashboard (React Dev Server) ─────────────────────────────────────────────
+  # ── Dashboard (React + Cytoscape.js SOC UI) ──────────────────────────────────
   dashboard:
     build:
       context: ./dashboard
@@ -190,13 +431,137 @@ services:
     container_name: thor-dashboard
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "3002:3000"
     volumes:
-      - ./dashboard/src:/app/src
+      - ./dashboard/src:/app/src:ro
     environment:
-      VITE_API_URL: "http://localhost:8000"
+      VITE_API_URL: "${VITE_API_URL:-http://localhost:8000}"
+      VITE_KEYCLOAK_URL: "http://localhost:8180"
+      VITE_KEYCLOAK_REALM: "thor"
+      VITE_KEYCLOAK_CLIENT_ID: "thor-dashboard"
+      VITE_GRAFANA_URL: "http://localhost:3001"
+      VITE_JAEGER_URL: "http://localhost:16686"
       PORT: "3000"
     depends_on:
       - control-plane
     networks:
+      - thor-net
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OBSERVABILITY — Prometheus + Grafana + Loki + Jaeger
+# ─────────────────────────────────────────────────────────────────────────────
+
+  # ── Prometheus (Metrics Collection) ─────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: thor-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - prometheus_data:/prometheus
+      - ./monitoring/prometheus:/etc/prometheus:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--storage.tsdb.retention.size=10GB"
+      - "--web.enable-lifecycle"
+      - "--web.enable-admin-api"
+      - "--log.level=warn"
+    networks:
+      - thor-net
+      - thor-obs-net
+
+  # ── Grafana (Visualization — Dashboards + Keycloak SSO + Loki/Jaeger sources) ─
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: thor-grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning/datasources:ro
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_GENERIC_OAUTH_ENABLED: "true"
+      GF_AUTH_GENERIC_OAUTH_CLIENT_ID: "grafana"
+      GF_AUTH_GENERIC_OAUTH_NAME: "Keycloak"
+      GF_AUTH_GENERIC_OAUTH_ALLOW_SIGN_UP: "true"
+      GF_AUTH_GENERIC_OAUTH_AUTH_URL: "http://keycloak:8080/realms/thor/protocol/openid-connect/auth"
+      GF_AUTH_GENERIC_OAUTH_TOKEN_URL: "http://keycloak:8080/realms/thor/protocol/openid-connect/token"
+      GF_AUTH_GENERIC_OAUTH_API_URL: "http://keycloak:8080/realms/thor/protocol/openid-connect/userinfo"
+      GF_INSTALL_PLUGINS: "grafana-clickhouse-datasource,grafana-piechart-panel,grafana-worldmap-panel"
+      GF_FEATURE_TOGGLES_ENABLE: "traceToMetrics,traceToLogs"
+    depends_on:
+      - prometheus
+      - loki
+    networks:
+      - thor-obs-net
+
+  # ── Loki (Log Aggregation — structured JSON logs from all services) ──────────
+  loki:
+    image: grafana/loki:3.1.0
+    container_name: thor-loki
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki_data:/loki
+      - ./monitoring/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+    command: -config.file=/etc/loki/loki-config.yml
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3100/ready && echo ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - thor-obs-net
+
+  # ── Promtail (Log Shipper → Loki) ────────────────────────────────────────────
+  promtail:
+    image: grafana/promtail:3.1.0
+    container_name: thor-promtail
+    restart: unless-stopped
+    volumes:
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - ./monitoring/promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+    command: -config.file=/etc/promtail/promtail-config.yml
+    depends_on:
+      loki:
+        condition: service_healthy
+    networks:
+      - thor-obs-net
+
+  # ── Jaeger (Distributed Tracing — OpenTelemetry OTLP) ───────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:1.58
+    container_name: thor-jaeger
+    restart: unless-stopped
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+      - "14268:14268"  # Jaeger HTTP thrift
+    volumes:
+      - jaeger_data:/badger
+    environment:
+      SPAN_STORAGE_TYPE: badger
+      BADGER_EPHEMERAL: "false"
+      BADGER_DIRECTORY_VALUE: /badger/data
+      BADGER_DIRECTORY_KEY: /badger/key
+      COLLECTOR_OTLP_ENABLED: "true"
+      LOG_LEVEL: warn
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:16686/ | head -1 && echo ok || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - thor-obs-net
       - thor-net

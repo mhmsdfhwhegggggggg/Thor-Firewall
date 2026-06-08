@@ -1,0 +1,62 @@
+# Thor Firewall — Grafana Datasource Provisioning
+# ─────────────────────────────────────────────────────────────────────────────
+# يُضيف تلقائياً: Prometheus + Loki + Jaeger + ClickHouse
+
+apiVersion: 1
+
+deleteDatasources: []
+
+datasources:
+  # ── Prometheus (Metrics) ───────────────────────────────────────────────────
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: 15s
+      exemplarTraceIdDestinations:
+        - name: traceID
+          datasourceUid: jaeger
+
+  # ── Loki (Logs) ─────────────────────────────────────────────────────────────
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      maxLines: 10000
+      derivedFields:
+        - name: TraceID
+          matcherRegex: "traceID=(\\w+)"
+          url: "$${__value.raw}"
+          datasourceUid: jaeger
+
+  # ── Jaeger (Traces) ─────────────────────────────────────────────────────────
+  - name: Jaeger
+    type: jaeger
+    uid: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    jsonData:
+      tracesToLogs:
+        datasourceUid: loki
+        tags: [service, component]
+        mappedTags:
+          - key: service.name
+            value: service
+
+  # ── ClickHouse (Flow Data) ───────────────────────────────────────────────────
+  - name: ClickHouse
+    type: grafana-clickhouse-datasource
+    access: proxy
+    url: http://clickhouse:8123
+    jsonData:
+      host: clickhouse
+      port: 9000
+      username: thor
+      defaultDatabase: thor
+      protocol: native
+    secureJsonData:
+      password: "${CLICKHOUSE_PASSWORD:-thor_dev_password}"
