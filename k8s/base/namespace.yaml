@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: thor-firewall
+  labels:
+    app.kubernetes.io/name: thor-firewall
+    app.kubernetes.io/version: "0.2.0"
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

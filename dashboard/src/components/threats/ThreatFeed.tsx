@@ -1,198 +1,168 @@
 // Thor Firewall Dashboard — Live Threat Feed
-import React, { useRef, useEffect } from "react";
-import { AlertTriangle, ShieldOff, Shield, Clock, ExternalLink } from "lucide-react";
-import type { Severity, ThreatEvent } from "../../types";
+import React, { memo, useMemo } from "react";
+import { AlertOctagon, AlertTriangle, Info, ShieldOff, Clock } from "lucide-react";
+import type { ThreatEvent, Severity } from "../../types";
 
-// ============================================================================
-// Severity styling
-// ============================================================================
-
-const SEV_CONFIG: Record<Severity, { border: string; bg: string; text: string; icon: React.ReactNode }> = {
-  low:      { border: "border-blue-500/30",  bg: "bg-blue-500/10",  text: "text-blue-400",   icon: <AlertTriangle className="h-3.5 w-3.5" /> },
-  medium:   { border: "border-amber-500/30", bg: "bg-amber-500/10", text: "text-amber-400",  icon: <AlertTriangle className="h-3.5 w-3.5" /> },
-  high:     { border: "border-orange-500/30",bg: "bg-orange-500/10",text: "text-orange-400", icon: <ShieldOff     className="h-3.5 w-3.5" /> },
-  critical: { border: "border-red-500/40",   bg: "bg-red-500/15",   text: "text-red-400",    icon: <ShieldOff     className="h-3.5 w-3.5" /> },
+const SEVERITY_META: Record<Severity, { label: string; icon: React.ReactNode; classes: string }> = {
+  critical: {
+    label: "CRITICAL",
+    icon: <AlertOctagon className="h-4 w-4" />,
+    classes: "border-red-500 bg-red-950/60 text-red-400",
+  },
+  high: {
+    label: "HIGH",
+    icon: <AlertTriangle className="h-4 w-4" />,
+    classes: "border-orange-500 bg-orange-950/60 text-orange-400",
+  },
+  medium: {
+    label: "MEDIUM",
+    icon: <AlertTriangle className="h-4 w-4" />,
+    classes: "border-amber-500 bg-amber-950/60 text-amber-400",
+  },
+  low: {
+    label: "LOW",
+    icon: <Info className="h-4 w-4" />,
+    classes: "border-blue-500 bg-blue-950/60 text-blue-400",
+  },
 };
 
-// ============================================================================
-// Single threat card
-// ============================================================================
-
-function ago(ts: number): string {
+function timeAgo(ts: number): string {
   const s = Math.floor((Date.now() - ts) / 1000);
-  if (s < 60)   return `${s}s ago`;
-  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-  return `${Math.floor(s / 3600)}h ago`;
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  return `${Math.floor(m / 60)}h ago`;
 }
 
-interface ThreatCardProps {
+interface ThreatRowProps {
   event: ThreatEvent;
-  isNew?: boolean;
+  onBlock?: (event: ThreatEvent) => void;
 }
 
-function ThreatCard({ event, isNew }: ThreatCardProps) {
-  const sev = SEV_CONFIG[event.severity];
+const ThreatRow = memo(function ThreatRow({ event, onBlock }: ThreatRowProps) {
+  const meta = SEVERITY_META[event.severity];
 
   return (
     <div
-      className={`rounded-lg border ${sev.border} ${sev.bg} p-3 transition-all duration-300 ${
-        isNew ? "ring-1 ring-white/20 animate-pulse-once" : ""
-      }`}
+      className={`group flex items-start gap-3 rounded-lg border p-3 transition-all hover:brightness-110 ${meta.classes}`}
     >
-      {/* Header row */}
-      <div className="flex items-start justify-between gap-2">
-        <div className="flex items-center gap-2 min-w-0">
-          <span className={sev.text}>{sev.icon}</span>
-          <span className={`text-xs font-semibold uppercase tracking-wide ${sev.text}`}>
-            {event.severity}
+      <div className="mt-0.5 shrink-0">{meta.icon}</div>
+
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs font-bold tracking-widest">{meta.label}</span>
+          <span className="rounded bg-white/10 px-1.5 py-0.5 text-xs font-mono text-white/80">
+            {event.threatType}
           </span>
-          <span className="text-xs font-medium text-white/80 truncate">{event.threatType}</span>
-        </div>
-        <div className="flex shrink-0 items-center gap-2 text-[10px] text-white/40">
-          <Clock className="h-3 w-3" />
-          {ago(event.timestamp)}
-        </div>
-      </div>
-
-      {/* Flow info */}
-      <div className="mt-2 flex flex-wrap gap-x-4 gap-y-0.5 font-mono text-[10px] text-white/50">
-        <span>
-          <span className="text-white/30">SRC </span>
-          <span className="text-white/70">{event.flow.srcIp}:{event.flow.srcPort}</span>
-        </span>
-        <span className="text-white/20">→</span>
-        <span>
-          <span className="text-white/30">DST </span>
-          <span className="text-white/70">{event.flow.dstIp}:{event.flow.dstPort}</span>
-        </span>
-        <span className="rounded bg-white/10 px-1 uppercase">{event.flow.protocol}</span>
-      </div>
-
-      {/* Explanation */}
-      {event.explanation && (
-        <p className="mt-1.5 text-[11px] text-white/50 leading-relaxed line-clamp-2">
-          {event.explanation}
-        </p>
-      )}
-
-      {/* Footer */}
-      <div className="mt-2 flex items-center justify-between">
-        <div className="flex items-center gap-3 text-[10px]">
-          {/* Risk score bar */}
-          <div className="flex items-center gap-1.5">
-            <span className="text-white/30">Risk</span>
-            <div className="h-1 w-16 rounded-full bg-white/10">
-              <div
-                className={`h-full rounded-full ${
-                  event.riskScore > 0.7 ? "bg-red-500" :
-                  event.riskScore > 0.4 ? "bg-amber-500" : "bg-green-500"
-                }`}
-                style={{ width: `${event.riskScore * 100}%` }}
-              />
-            </div>
-            <span className={`font-mono ${sev.text}`}>{(event.riskScore * 100).toFixed(0)}%</span>
-          </div>
-
-          {/* MITRE */}
           {event.mitreTechnique && (
-            <a
-              href={`https://attack.mitre.org/techniques/${event.mitreTechnique.replace(".", "/")}/`}
-              target="_blank"
-              rel="noreferrer"
-              className="flex items-center gap-0.5 rounded bg-white/5 px-1.5 py-0.5 text-white/30 hover:text-white/60"
-            >
+            <span className="rounded bg-white/10 px-1.5 py-0.5 text-xs font-mono text-white/60">
               {event.mitreTechnique}
-              <ExternalLink className="h-2.5 w-2.5" />
-            </a>
+            </span>
           )}
+          <span className="ml-auto flex items-center gap-1 text-xs text-white/50">
+            <Clock className="h-3 w-3" />
+            {timeAgo(event.timestamp)}
+          </span>
         </div>
 
-        {/* Block status */}
-        <div className={`flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${
-          event.blocked
-            ? "bg-green-500/20 text-green-400"
-            : "bg-red-500/20 text-red-400"
-        }`}>
-          {event.blocked ? <Shield className="h-3 w-3" /> : <ShieldOff className="h-3 w-3" />}
-          {event.blocked ? "Blocked" : "Active"}
+        <div className="mt-1 font-mono text-sm text-white/90">
+          {event.flow.srcIp}:{event.flow.srcPort}
+          <span className="mx-2 text-white/40">→</span>
+          {event.flow.dstIp}:{event.flow.dstPort}
+          <span className="ml-2 text-white/40">[{event.flow.protocol.toUpperCase()}]</span>
         </div>
+
+        <div className="mt-1 flex items-center gap-4 text-xs text-white/60">
+          <span>Risk: <strong className="text-white/90">{(event.riskScore * 100).toFixed(0)}%</strong></span>
+          <span>Confidence: <strong className="text-white/90">{(event.confidence * 100).toFixed(0)}%</strong></span>
+          {event.blocked
+            ? <span className="text-red-400">● Blocked</span>
+            : <span className="text-amber-400">● Monitoring</span>
+          }
+          <span>Agent: <span className="font-mono">{event.agentId}</span></span>
+        </div>
+
+        {event.explanation && (
+          <p className="mt-1.5 text-xs text-white/50 italic">{event.explanation}</p>
+        )}
       </div>
+
+      {!event.blocked && onBlock && (
+        <button
+          onClick={() => onBlock(event)}
+          className="hidden shrink-0 items-center gap-1 rounded bg-red-800/60 px-2 py-1 text-xs font-medium text-red-300 hover:bg-red-700/80 group-hover:flex"
+        >
+          <ShieldOff className="h-3 w-3" />
+          Block
+        </button>
+      )}
     </div>
   );
-}
+});
 
 // ============================================================================
-// Main Component
-// ============================================================================
 
-interface ThreatFeedProps {
-  events:    ThreatEvent[];
+interface Props {
+  events: ThreatEvent[];
+  onBlock?: (event: ThreatEvent) => void;
+  filter?: Severity | "all";
   maxHeight?: string;
 }
 
-export function ThreatFeed({ events, maxHeight = "100%" }: ThreatFeedProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const isAtBottom   = useRef(true);
+export const ThreatFeed = memo(function ThreatFeed({
+  events,
+  onBlock,
+  filter = "all",
+  maxHeight = "480px",
+}: Props) {
+  const filtered = useMemo(
+    () =>
+      filter === "all"
+        ? events
+        : events.filter((e) => e.severity === filter),
+    [events, filter]
+  );
 
-  // Auto-scroll to bottom if user is already at bottom
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el || !isAtBottom.current) return;
-    el.scrollTop = 0; // newest at top
-  }, [events.length]);
-
-  const criticalCount  = events.filter((e) => e.severity === "critical").length;
-  const highCount      = events.filter((e) => e.severity === "high").length;
-  const blockedCount   = events.filter((e) => e.blocked).length;
+  const counts = useMemo(
+    () => ({
+      critical: events.filter((e) => e.severity === "critical").length,
+      high: events.filter((e) => e.severity === "high").length,
+      medium: events.filter((e) => e.severity === "medium").length,
+      low: events.filter((e) => e.severity === "low").length,
+    }),
+    [events]
+  );
 
   return (
-    <div className="flex flex-col h-full gap-3">
+    <div className="flex h-full flex-col gap-3">
       {/* Header */}
-      <div className="flex shrink-0 items-center justify-between">
-        <div className="flex items-center gap-2">
-          <ShieldOff className="h-4 w-4 text-red-400" />
-          <span className="text-sm font-semibold text-white/70">Live Threat Feed</span>
-          <span className="rounded-full bg-red-500/20 px-2 py-0.5 text-[10px] font-bold text-red-400">
-            {events.length}
-          </span>
-        </div>
-        <div className="flex gap-2 text-[10px]">
-          {criticalCount > 0 && (
-            <span className="rounded-full bg-red-500/20 px-2 py-0.5 text-red-400">
-              {criticalCount} critical
+      <div className="flex flex-wrap items-center gap-2">
+        <h3 className="text-sm font-semibold text-white/90">Live Threat Feed</h3>
+        <div className="ml-auto flex gap-2 text-xs">
+          {(["critical", "high", "medium", "low"] as Severity[]).map((s) => (
+            <span key={s} className={`rounded px-2 py-0.5 font-mono ${SEVERITY_META[s].classes}`}>
+              {counts[s]} {s}
             </span>
-          )}
-          {highCount > 0 && (
-            <span className="rounded-full bg-orange-500/20 px-2 py-0.5 text-orange-400">
-              {highCount} high
-            </span>
-          )}
-          <span className="rounded-full bg-green-500/20 px-2 py-0.5 text-green-400">
-            {blockedCount} blocked
-          </span>
+          ))}
         </div>
       </div>
 
       {/* Feed */}
       <div
-        ref={containerRef}
-        className="flex-1 space-y-2 overflow-y-auto pr-1"
+        className="flex flex-col gap-2 overflow-y-auto pr-1 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-white/10"
         style={{ maxHeight }}
-        onScroll={(e) => {
-          const el = e.currentTarget;
-          isAtBottom.current = el.scrollTop < 100;
-        }}
       >
-        {events.length === 0 ? (
-          <div className="flex h-32 items-center justify-center text-white/20 text-sm">
-            No threats detected
+        {filtered.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-16 text-white/30">
+            <Shield className="mb-3 h-12 w-12" />
+            <p className="text-sm">No threats detected</p>
           </div>
         ) : (
-          events.map((event, i) => (
-            <ThreatCard key={event.eventId} event={event} isNew={i === 0} />
+          filtered.map((event) => (
+            <ThreatRow key={event.eventId} event={event} onBlock={onBlock} />
           ))
         )}
       </div>
     </div>
   );
-}
+});

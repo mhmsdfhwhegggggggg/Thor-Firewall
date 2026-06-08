@@ -1,0 +1,376 @@
+openapi: "3.1.0"
+info:
+  title: Thor Firewall Control Plane API
+  version: "0.3.0"
+  description: |
+    **Thor NGFW REST API** — الواجهة البرمجية الكاملة للتحكم في نظام Thor Firewall.
+
+    ## Authentication
+    All endpoints require authentication via:
+    - `Bearer <JWT>` header
+    - `X-API-Key: <key>` header
+
+    ## Roles
+    - `admin`    — Full access
+    - `operator` — Read + write rules + blocklist
+    - `viewer`   — Read only
+
+    ## Rate Limits
+    - General API: 100 req/min per IP
+    - Query (AI):  10 req/min per IP
+    - Auth:        5 req/min per IP
+  contact:
+    name: Thor Firewall Team
+    url:  https://github.com/mhmsdfhwhegggggggg/Thor-Firewall
+  license:
+    name: MIT
+
+servers:
+  - url: /api/v1
+    description: Versioned API
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+  schemas:
+    FlowRecord:
+      type: object
+      required: [src_ip, dst_ip, src_port, dst_port, protocol, decision, risk_score, timestamp]
+      properties:
+        src_ip:      { type: string, example: "192.168.1.100" }
+        dst_ip:      { type: string, example: "10.0.0.5" }
+        src_port:    { type: integer, minimum: 0, maximum: 65535 }
+        dst_port:    { type: integer, minimum: 0, maximum: 65535 }
+        protocol:    { type: string, enum: [TCP, UDP, ICMP] }
+        decision:    { type: string, enum: [allow, block, throttle, mirror, redirect] }
+        risk_score:  { type: number, minimum: 0, maximum: 1, example: 0.85 }
+        confidence:  { type: number, minimum: 0, maximum: 1 }
+        packets:     { type: integer }
+        bytes:       { type: integer }
+        duration_ms: { type: integer }
+        first_seen:  { type: number, description: "Unix timestamp" }
+        threat_type: { type: string, example: "syn-flood" }
+        mitre_id:    { type: string, example: "T1498.001" }
+        explanation: { type: string }
+        app_proto:   { type: string, example: "HTTPS" }
+        tls_ja3:     { type: string }
+        geo_country: { type: string, example: "CN" }
+
+    ThreatEvent:
+      type: object
+      required: [src_ip, dst_ip, dst_port, protocol, threat_type, severity, risk_score, timestamp]
+      properties:
+        id:          { type: string, format: uuid }
+        src_ip:      { type: string }
+        dst_ip:      { type: string }
+        src_port:    { type: integer }
+        dst_port:    { type: integer }
+        protocol:    { type: string }
+        threat_type: { type: string, enum: [syn-flood, port-scan, brute-force, dns-tunnel, data-exfil, c2-comm, ransomware, zero-day, malware] }
+        severity:    { type: string, enum: [low, medium, high, critical] }
+        risk_score:  { type: number, minimum: 0, maximum: 1 }
+        confidence:  { type: number }
+        blocked:     { type: boolean }
+        mitre_id:    { type: string }
+        explanation: { type: string }
+        timestamp:   { type: number }
+
+    FirewallRule:
+      type: object
+      required: [rule_id, name, action, priority, is_active]
+      properties:
+        rule_id:     { type: string }
+        name:        { type: string }
+        description: { type: string }
+        src_cidr:    { type: string, example: "10.0.0.0/8" }
+        dst_cidr:    { type: string }
+        dst_port:    { oneOf: [{ type: integer }, { type: array, items: { type: integer } }] }
+        protocol:    { type: string, enum: [TCP, UDP, ICMP, any] }
+        action:      { type: string, enum: [allow, block, throttle, log, mirror] }
+        priority:    { type: integer, minimum: 0, maximum: 2000 }
+        is_active:   { type: boolean }
+        expires_at:  { type: number }
+        hit_count:   { type: integer, readOnly: true }
+        created_at:  { type: number, readOnly: true }
+
+    NetworkStats:
+      type: object
+      properties:
+        packets_per_second:  { type: number }
+        bits_per_second:     { type: number }
+        active_flows:        { type: integer }
+        blocked_flows:       { type: integer }
+        threats_today:       { type: integer }
+        blocked_today:       { type: integer }
+        ml_accuracy:         { type: number }
+        ml_latency_us:       { type: number }
+        throughput_mbps:     { type: number }
+        timestamp:           { type: number }
+
+    QueryRequest:
+      type: object
+      required: [query]
+      properties:
+        query:    { type: string, example: "What are the top threats in the last hour?" }
+        language: { type: string, enum: [en, ar], default: en }
+
+    QueryResponse:
+      type: object
+      properties:
+        response:    { type: string }
+        model:       { type: string }
+        latency_ms:  { type: number }
+        sources:     { type: array, items: { type: string } }
+
+    Error:
+      type: object
+      properties:
+        error:   { type: string }
+        detail:  { type: string }
+        status:  { type: integer }
+
+security:
+  - BearerAuth: []
+  - ApiKeyAuth: []
+
+paths:
+  # ── Health ────────────────────────────────────────────────────────────────
+  /health:
+    get:
+      summary: Health check
+      security: []
+      tags: [System]
+      responses:
+        "200":
+          description: System healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:     { type: string, example: healthy }
+                  version:    { type: string, example: "0.3.0" }
+                  components: { type: object }
+
+  # ── Flows ─────────────────────────────────────────────────────────────────
+  /flows:
+    get:
+      summary: List recent network flows
+      tags: [Flows]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 100, maximum: 10000 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0 }
+        - name: decision
+          in: query
+          schema: { type: string, enum: [allow, block, throttle] }
+        - name: min_risk
+          in: query
+          schema: { type: number, minimum: 0, maximum: 1 }
+        - name: src_ip
+          in: query
+          schema: { type: string }
+        - name: since
+          in: query
+          schema: { type: number, description: "Unix timestamp" }
+      responses:
+        "200":
+          description: Flow list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:  { type: integer }
+                  flows:  { type: array, items: { $ref: "#/components/schemas/FlowRecord" } }
+        "401": { description: Unauthorized }
+
+  /flows/{flow_id}/block:
+    post:
+      summary: Block a specific flow's source IP
+      tags: [Flows]
+      parameters:
+        - name: flow_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+                duration_hours: { type: integer, default: 1 }
+      responses:
+        "200": { description: IP blocked }
+
+  # ── Threats ───────────────────────────────────────────────────────────────
+  /threats:
+    get:
+      summary: List threat events
+      tags: [Threats]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50 }
+        - name: severity
+          in: query
+          schema: { type: string, enum: [low, medium, high, critical] }
+        - name: since
+          in: query
+          schema: { type: number }
+      responses:
+        "200":
+          description: Threat list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ThreatEvent" }
+
+  # ── Rules ─────────────────────────────────────────────────────────────────
+  /rules:
+    get:
+      summary: List all firewall rules
+      tags: [Rules]
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/FirewallRule" }
+
+    post:
+      summary: Create a new firewall rule
+      tags: [Rules]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FirewallRule" }
+      responses:
+        "201":
+          description: Rule created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FirewallRule" }
+
+  /rules/{rule_id}:
+    delete:
+      summary: Delete a firewall rule
+      tags: [Rules]
+      parameters:
+        - name: rule_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: Rule deleted }
+
+  /rules/{rule_id}/toggle:
+    post:
+      summary: Toggle rule active/inactive
+      tags: [Rules]
+      parameters:
+        - name: rule_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  is_active: { type: boolean }
+
+  # ── Analytics ─────────────────────────────────────────────────────────────
+  /analytics/network:
+    get:
+      summary: Real-time network statistics
+      tags: [Analytics]
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NetworkStats" }
+
+  /analytics/top-threats:
+    get:
+      summary: Top threat sources in time window
+      tags: [Analytics]
+      parameters:
+        - name: hours
+          in: query
+          schema: { type: integer, default: 24 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20 }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    src_ip:     { type: string }
+                    count:      { type: integer }
+                    max_risk:   { type: number }
+                    threat_type: { type: string }
+                    geo_country: { type: string }
+
+  # ── AI Query ──────────────────────────────────────────────────────────────
+  /query:
+    post:
+      summary: Ask the AI security assistant
+      description: |
+        Sends a natural language query to the Mistral-7B security assistant
+        with RAG over MITRE ATT&CK, CVE database, and live threat intel.
+      tags: [AI]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/QueryRequest" }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/QueryResponse" }
+        "503":
+          description: AI engine unavailable
+
+  # ── WebSocket ─────────────────────────────────────────────────────────────
+  /ws:
+    get:
+      summary: WebSocket real-time feed
+      description: |
+        Bi-directional WebSocket for live events.
+
+        **Server messages:**
+        - `{"type":"stats", ...NetworkStats}`
+        - `{"type":"threat_event", ...ThreatEvent}`
+        - `{"type":"snapshot", "threats": [...]}`
+
+        **Client commands:**
+        - `{"cmd":"block_ip", "ip":"1.2.3.4"}`
+        - `{"cmd":"subscribe", "topics":["threats","stats"]}`
+      tags: [WebSocket]
+      responses:
+        "101": { description: Switching Protocols }

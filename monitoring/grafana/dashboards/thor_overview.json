@@ -1,0 +1,248 @@
+{
+  "title": "Thor Firewall — Overview",
+  "uid": "thor-overview-v2",
+  "version": 2,
+  "schemaVersion": 39,
+  "refresh": "5s",
+  "time": { "from": "now-1h", "to": "now" },
+  "tags": ["thor", "firewall", "security"],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Packets Per Second",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1000000 },
+              { "color": "red", "value": 8000000 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(thor_packets_total[1m]))",
+          "legendFormat": "PPS"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Network Throughput",
+      "type": "stat",
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 5000000000 },
+              { "color": "red", "value": 9000000000 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(thor_bytes_total[1m])) * 8",
+          "legendFormat": "bps"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Active Flows",
+      "type": "stat",
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 500000 },
+              { "color": "red", "value": 900000 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "thor_active_flows",
+          "legendFormat": "Flows"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Blocked Threats (5m)",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "fixedColor": "red", "mode": "fixed" }
+        }
+      },
+      "targets": [
+        {
+          "expr": "increase(thor_blocked_flows_total[5m])",
+          "legendFormat": "Blocked"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "ML Inference Latency",
+      "type": "stat",
+      "gridPos": { "x": 16, "y": 0, "w": 4, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 150 },
+              { "color": "red", "value": 200 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, rate(thor_ml_inference_duration_seconds_bucket[5m])) * 1e6",
+          "legendFormat": "P99"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "ML Accuracy",
+      "type": "stat",
+      "gridPos": { "x": 20, "y": 0, "w": 4, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.99 },
+              { "color": "green", "value": 0.995 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "thor_ml_accuracy",
+          "legendFormat": "Accuracy"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Throughput Over Time",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(thor_packets_total[30s]))",
+          "legendFormat": "Total PPS"
+        },
+        {
+          "expr": "sum(rate(thor_blocked_flows_total[30s]))",
+          "legendFormat": "Blocked/s"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Threat Events by Severity",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "critical" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "high" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "medium" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "increase(thor_threat_events_total{severity='critical'}[1m])",
+          "legendFormat": "critical"
+        },
+        {
+          "expr": "increase(thor_threat_events_total{severity='high'}[1m])",
+          "legendFormat": "high"
+        },
+        {
+          "expr": "increase(thor_threat_events_total{severity='medium'}[1m])",
+          "legendFormat": "medium"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "title": "Top Attacking IPs",
+      "type": "table",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+      "transformations": [
+        { "id": "sortBy", "options": { "fields": [{ "displayName": "Value", "desc": true }] } },
+        { "id": "limit", "options": { "limitCount": 10 } }
+      ],
+      "targets": [
+        {
+          "expr": "topk(10, sum by (src_ip) (increase(thor_blocked_flows_total[1h])))",
+          "legendFormat": "{{src_ip}}",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "title": "XDP Action Distribution",
+      "type": "piechart",
+      "gridPos": { "x": 12, "y": 12, "w": 6, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum by (action) (thor_xdp_actions_total)",
+          "legendFormat": "{{action}}"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "title": "Attack Type Distribution",
+      "type": "piechart",
+      "gridPos": { "x": 18, "y": 12, "w": 6, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum by (threat_type) (increase(thor_threat_events_total[1h]))",
+          "legendFormat": "{{threat_type}}"
+        }
+      ]
+    }
+  ]
+}

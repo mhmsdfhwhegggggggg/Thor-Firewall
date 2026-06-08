@@ -1,29 +1,34 @@
 """
-Thor Firewall — MARL Training Script — COMPLETE IMPLEMENTATION
-سكريبت تدريب شامل لنظام التعلم المعزز المتعدد الوكلاء
+Thor Firewall — MARL Training Script
+سكريبت تدريب نظام التعلم المعزز المتعدد الوكلاء
 
 يستخدم:
 - مجموعة بيانات CICIDS2017/2018 للتدريب المُشرف الأولي
-- بيئة شبكية مُحاكاة للتدريب المعزز (PPO)
+- بيئة شبكية مُحاكاة للتدريب المعزز
+- Ray RLlib للتدريب الموزع
 - Weights & Biases لتتبع التجارب
 
 الاستخدام:
-    python -m ml.training.train_marl --epochs 100 --protocol tcp
+    python -m ml.training.train_marl \
+        --dataset ml/data/CICIDS2017 \
+        --output ml/checkpoints/ \
+        --protocol tcp \
+        --epochs 100 \
+        --wandb-project thor-marl
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import logging
 import os
-import random
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 try:
     import wandb
@@ -31,325 +36,233 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
 
-from ml.marl.agents import ACTION_SPACE, MARLConfig, MetaAgent
+from ml.marl.agents import MetaAgent, MARLConfig, ACTION_SPACE
 
 logger = logging.getLogger("thor.training")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
 
 # ============================================================================
-# Configuration
-# ============================================================================
-
-FEATURE_NAMES = [
-    # Flow features (الميزات الأساسية للتدفق)
-    "duration_s", "src_bytes", "dst_bytes", "src_packets", "dst_packets",
-    "bytes_per_packet", "packets_per_second", "bytes_per_second",
-    "avg_packet_size", "payload_entropy",
-    # TCP flags
-    "syn_count", "ack_count", "fin_count", "rst_count", "psh_count",
-    "urg_count", "tcp_window_mean", "tcp_window_std", "retrans_count", "ooo_count",
-    # Port info
-    "src_port_privileged", "dst_port_privileged", "dst_port_well_known",
-    "dst_port_80", "dst_port_443", "dst_port_22", "dst_port_53",
-    "dst_port_3389", "dst_port_445", "dst_port_8080",
-    # Inter-arrival time
-    "iat_mean", "iat_std", "iat_min", "iat_max", "iat_cv",
-    # Burst
-    "burst_count", "burst_duration_mean", "burst_bytes_mean",
-    # IP features
-    "ttl", "dscp",
-    # Time features
-    "hour_of_day_sin", "hour_of_day_cos", "day_of_week_sin", "day_of_week_cos",
-    # GNN embeddings (32 dim)
-    *[f"gnn_emb_{i}" for i in range(32)],
-]
-
-assert len(FEATURE_NAMES) == 82, f"Expected 82 features, got {len(FEATURE_NAMES)}"
-
-
-# ============================================================================
-# Synthetic Network Environment
+# Network Simulation Environment
 # ============================================================================
 
 class NetworkEnv:
     """
     بيئة محاكاة شبكية للتدريب المعزز
-    تولد تدفقات طبيعية وهجمات متنوعة
+
+    تُحاكي حركة مرور الشبكة الحقيقية:
+    - حركة مرور طبيعية (HTTP, HTTPS, DNS, NTP)
+    - هجمات DoS/DDoS
+    - مسح المنافذ
+    - هجمات Brute Force
+    - C2 Communication
     """
 
-    ATTACK_TYPES = [
-        "normal",
-        "syn_flood",
-        "udp_flood",
-        "port_scan",
-        "brute_force",
-        "dns_tunnel",
-        "c2_beacon",
-        "data_exfil",
-        "slowloris",
-    ]
+    def __init__(self, dataset_path: Optional[str] = None, seed: int = 42):
+        self.rng = np.random.default_rng(seed)
+        self.dataset = self._load_dataset(dataset_path)
+        self.step_count = 0
+        self.episode_count = 0
 
-    ATTACK_WEIGHTS = [0.70, 0.06, 0.04, 0.05, 0.04, 0.03, 0.03, 0.03, 0.02]
+        # إحصاءات التدريب
+        self.true_positives = 0
+        self.true_negatives = 0
+        self.false_positives = 0
+        self.false_negatives = 0
 
-    def __init__(self, protocol: str = "tcp", seed: int = 42):
-        self.protocol = protocol
-        self.rng = np.random.RandomState(seed)
+    def _load_dataset(self, path: Optional[str]) -> Optional[dict]:
+        """تحميل CICIDS2017/2018 dataset"""
+        if not path or not Path(path).exists():
+            logger.warning("No dataset found, using synthetic data generation")
+            return None
 
-    def generate_flow(self) -> Tuple[np.ndarray, bool, str]:
+        logger.info(f"Loading dataset from {path}")
+        try:
+            import pandas as pd
+            dfs = []
+            for f in Path(path).glob("*.csv"):
+                df = pd.read_csv(f, low_memory=False)
+                dfs.append(df)
+
+            if not dfs:
+                return None
+
+            df = pd.concat(dfs, ignore_index=True)
+            logger.info(f"Loaded {len(df):,} samples from CICIDS dataset")
+
+            # تنظيف البيانات
+            df = df.replace([np.inf, -np.inf], np.nan).dropna()
+
+            # استخراج الميزات والتسميات
+            feature_cols = [c for c in df.columns if c not in ["Label", "Flow ID", "Source IP"]]
+            X = df[feature_cols[:50]].values.astype(np.float32)
+            y = (df["Label"] != "BENIGN").astype(int).values
+
+            # توحيد القيم
+            from sklearn.preprocessing import StandardScaler
+            scaler = StandardScaler()
+            X = scaler.fit_transform(X)
+
+            return {"X": X, "y": y, "n_samples": len(X)}
+
+        except Exception as e:
+            logger.error(f"Failed to load dataset: {e}")
+            return None
+
+    def _generate_synthetic_sample(self) -> Tuple[np.ndarray, bool]:
+        """توليد عينة اصطناعية للاختبار"""
+        is_attack = self.rng.random() < 0.3  # 30% هجمات
+
+        features = np.zeros(82, dtype=np.float32)
+
+        if is_attack:
+            attack_type = self.rng.integers(0, 5)
+            if attack_type == 0:  # SYN flood
+                features[0] = self.rng.uniform(40, 60)   # packet_len صغير
+                features[20] = 1.0   # SYN flag
+                features[6] = 1.0    # TCP protocol
+                features[13] = 0.0   # ليس well-known port
+                features[30] = 0.5   # entropy منخفض
+
+            elif attack_type == 1:  # Port scan
+                features[0] = self.rng.uniform(40, 80)
+                features[20] = 1.0   # SYN
+                features[11] = self.rng.uniform(1, 1024)  # منافذ متعددة
+
+            elif attack_type == 2:  # DDoS UDP
+                features[0] = self.rng.uniform(500, 1500)
+                features[6] = 2.0    # UDP
+                features[30] = self.rng.uniform(7.0, 8.0)  # entropy عالية
+
+            elif attack_type == 3:  # Brute force SSH
+                features[11] = 22.0  # dst_port = 22
+                features[0] = self.rng.uniform(100, 200)
+                features[6] = 1.0    # TCP
+
+            elif attack_type == 4:  # C2 communication
+                features[30] = self.rng.uniform(7.5, 8.0)  # entropy عالية جداً
+                features[0] = self.rng.uniform(200, 800)
+                features[12] = 0.0   # ليس well-known port
+
+        else:  # حركة مرور طبيعية
+            traffic_type = self.rng.integers(0, 4)
+            if traffic_type == 0:  # HTTP
+                features[11] = 80.0 if self.rng.random() < 0.5 else 443.0
+                features[0] = self.rng.uniform(100, 1500)
+                features[30] = self.rng.uniform(3.0, 6.0)
+
+            elif traffic_type == 1:  # DNS
+                features[6] = 2.0   # UDP
+                features[11] = 53.0
+                features[0] = self.rng.uniform(60, 512)
+
+            elif traffic_type == 2:  # NTP
+                features[6] = 2.0
+                features[11] = 123.0
+                features[0] = self.rng.uniform(56, 90)
+
+            else:  # HTTPS/TLS
+                features[11] = 443.0
+                features[30] = self.rng.uniform(7.0, 8.0)  # TLS is encrypted
+                features[0] = self.rng.uniform(500, 1500)
+
+        # إضافة GNN embedding (32 features)
+        if is_attack:
+            gnn = self.rng.normal(0.7, 0.2, 32).astype(np.float32)
+        else:
+            gnn = self.rng.normal(0.1, 0.1, 32).astype(np.float32)
+        gnn = np.clip(gnn, 0, 1)
+        features[50:82] = gnn
+
+        return features, is_attack
+
+    def sample(self) -> Tuple[np.ndarray, bool, str]:
         """
-        توليد تدفق عشوائي
+        الحصول على عينة من البيئة
 
         Returns:
-            (feature_vector [82], is_attack, attack_type)
+            (state_features, is_attack, protocol)
         """
-        attack_type = self.rng.choice(self.ATTACK_TYPES, p=self.ATTACK_WEIGHTS)
-        is_attack = attack_type != "normal"
-        features = self._gen_features(attack_type)
-        return features, is_attack, attack_type
+        protocols = ["tcp", "udp", "icmp"]
 
-    def _gen_features(self, attack_type: str) -> np.ndarray:
-        """توليد ميزات التدفق بناءً على نوع الهجوم"""
-        f = np.zeros(82, dtype=np.float32)
-        r = self.rng
+        if self.dataset and self.rng.random() < 0.7:
+            # 70% من البيانات الحقيقية
+            idx = self.rng.integers(0, self.dataset["n_samples"])
+            X = self.dataset["X"][idx]
+            y = bool(self.dataset["y"][idx])
 
-        if attack_type == "normal":
-            f[0]  = r.exponential(10.0)         # duration
-            f[1]  = r.lognormal(10, 2)           # src_bytes
-            f[2]  = r.lognormal(12, 2)           # dst_bytes
-            f[3]  = r.randint(10, 10000)         # src_packets
-            f[4]  = r.randint(10, 10000)         # dst_packets
-            f[5]  = f[1] / max(f[3], 1)          # bytes/pkt
-            f[6]  = f[3] / max(f[0], 0.001)     # pps
-            f[9]  = r.uniform(3.0, 6.5)          # entropy (normal)
-            f[11] = r.randint(0, 3)              # syn count
-            f[12] = r.randint(10, 1000)          # ack count
+            # pad إلى 82 features
+            state = np.zeros(82, dtype=np.float32)
+            n = min(len(X), 50)
+            state[:n] = X[:n]
 
-        elif attack_type == "syn_flood":
-            f[0]  = r.uniform(0.01, 1.0)
-            f[1]  = r.uniform(100, 500)          # small bytes
-            f[2]  = 0                            # no response
-            f[3]  = r.randint(1000, 100_000)    # many packets
-            f[4]  = 0
-            f[6]  = f[3] / max(f[0], 0.001)    # very high pps
-            f[9]  = r.uniform(2.0, 3.5)          # low entropy (SYN only)
-            f[11] = f[3]                          # all SYN, no ACK
-            f[12] = 0
+            # GNN embedding اصطناعي
+            gnn = self.rng.normal(0.6 if y else 0.1, 0.15, 32).astype(np.float32)
+            state[50:82] = np.clip(gnn, 0, 1)
 
-        elif attack_type == "port_scan":
-            f[0]  = r.uniform(1.0, 60.0)
-            f[3]  = r.randint(50, 5000)
-            f[4]  = r.randint(0, 100)            # mostly no response
-            f[6]  = f[3] / max(f[0], 0.001)
-            f[9]  = r.uniform(1.0, 3.0)
-            f[11] = f[3]
-            f[13] = f[4] * 0.3                   # RST from closed ports
-
-        elif attack_type == "dns_tunnel":
-            f[0]  = r.exponential(30.0)
-            f[1]  = r.lognormal(8, 1)
-            f[9]  = r.uniform(7.5, 8.0)          # HIGH entropy (encoded data)
-            f[26] = 1.0                            # dst_port_53
-            f[6]  = r.uniform(1.0, 20.0)
-
-        elif attack_type == "c2_beacon":
-            f[0]  = r.exponential(300.0)          # long duration
-            # Very regular intervals (jitter < 1%)
-            base_iat = r.choice([30.0, 60.0, 120.0])
-            f[31] = base_iat
-            f[32] = base_iat * 0.005              # very low std
-            f[9]  = r.uniform(7.0, 8.0)           # encrypted traffic
-            f[6]  = r.uniform(0.01, 0.1)           # low pps
-
-        elif attack_type == "brute_force":
-            f[0]  = r.exponential(60.0)
-            f[3]  = r.randint(500, 5000)
-            f[25] = 1.0                            # dst_port_22 (SSH)
-            f[11] = f[3]                           # many SYN
-            f[12] = f[3] * 0.3
-            f[6]  = f[3] / max(f[0], 0.001)
-
-        elif attack_type == "data_exfil":
-            f[0]  = r.exponential(120.0)
-            f[1]  = r.lognormal(15, 1)            # HUGE src_bytes
-            f[2]  = r.lognormal(6, 1)
-            f[9]  = r.uniform(6.0, 8.0)
-            f[6]  = r.uniform(100, 1000)
-
-        elif attack_type == "slowloris":
-            f[0]  = r.uniform(60.0, 3600.0)       # very long connections
-            f[3]  = r.randint(5, 50)              # few packets
-            f[4]  = r.randint(5, 50)
-            f[6]  = 0.01
-            f[30] = r.uniform(20.0, 60.0)         # high IAT mean
-            f[32] = 5.0                            # IAT min
-
-        elif attack_type == "udp_flood":
-            f[0]  = r.uniform(0.01, 5.0)
-            f[1]  = r.uniform(1e6, 1e9)
-            f[3]  = r.randint(10000, 1_000_000)
-            f[6]  = f[3] / max(f[0], 0.001)
-
-        # Normalize + add noise
-        f[:50] = np.clip(f[:50] / (np.abs(f[:50]) + 1e-6 + 1000), -1, 1)
-
-        # Add random GNN embeddings (in real training: from GNN model)
-        f[50:] = r.randn(32).astype(np.float32) * 0.1
-
-        # Time features
-        h = r.randint(0, 24)
-        d = r.randint(0, 7)
-        f[42] = np.sin(2 * np.pi * h / 24)
-        f[43] = np.cos(2 * np.pi * h / 24)
-        f[44] = np.sin(2 * np.pi * d / 7)
-        f[45] = np.cos(2 * np.pi * d / 7)
-
-        return f
+            protocol = protocols[int(state[6]) % 3]
+            return state, y, protocol
+        else:
+            # 30% اصطناعي
+            state, is_attack = self._generate_synthetic_sample()
+            protocol = protocols[int(state[6]) % 3]
+            return state, is_attack, protocol
 
     def compute_reward(
         self,
         action: int,
         is_attack: bool,
-        attack_type: str,
-        latency_us: float,
+        latency_ms: float = 0.5,
     ) -> float:
-        """
-        حساب المكافأة بناءً على نتيجة القرار
-        """
-        action_name = ACTION_SPACE.get(action, "allow")
-        blocked = action_name == "block"
-
+        """حساب المكافأة مع تتبع الإحصاءات"""
         if is_attack:
-            if blocked:
-                r = 10.0
-                # مكافأة إضافية للهجمات الخطيرة
-                if attack_type in ("syn_flood", "c2_beacon", "data_exfil"):
-                    r += 2.0
-            else:
-                r = -10.0
-                if attack_type == "data_exfil":
-                    r -= 5.0  # عقوبة مضاعفة لتسريب البيانات
+            if action == 1:  # Block — صحيح
+                self.true_positives += 1
+                reward = 10.0
+            else:  # Allow — خطأ
+                self.false_negatives += 1
+                reward = -10.0
         else:
-            if not blocked:
-                r = 1.0
-            else:
-                r = -5.0  # false positive
+            if action == 0:  # Allow — صحيح
+                self.true_negatives += 1
+                reward = 1.0
+            elif action == 1:  # Block — خطأ
+                self.false_positives += 1
+                reward = -5.0
+            else:  # throttle/mirror/redirect
+                self.true_negatives += 1
+                reward = 0.5  # مقبول ولكن دون المستوى
 
-        # مكافأة الأداء
-        if latency_us < 100:
-            r += 0.1
-        elif latency_us > 1000:
-            r -= 0.05
+        # مكافأة صغيرة على السرعة
+        reward += max(0, (1.0 - latency_ms) * 0.1)
 
-        return r
+        self.step_count += 1
+        return reward
 
+    def metrics(self) -> Dict:
+        total = max(1, self.true_positives + self.true_negatives +
+                    self.false_positives + self.false_negatives)
+        precision = self.true_positives / max(1, self.true_positives + self.false_positives)
+        recall = self.true_positives / max(1, self.true_positives + self.false_negatives)
+        f1 = 2 * precision * recall / max(1e-8, precision + recall)
+        accuracy = (self.true_positives + self.true_negatives) / total
 
-# ============================================================================
-# CICIDS Dataset Loader
-# ============================================================================
+        return {
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1,
+            "true_positives": self.true_positives,
+            "true_negatives": self.true_negatives,
+            "false_positives": self.false_positives,
+            "false_negatives": self.false_negatives,
+            "fpr": self.false_positives / max(1, self.false_positives + self.true_negatives),
+            "fnr": self.false_negatives / max(1, self.false_negatives + self.true_positives),
+        }
 
-class CICIDSDataset:
-    """
-    محمّل مجموعة بيانات CICIDS2017/2018
-    تحميل من ملفات CSV
-    """
-
-    LABEL_MAP = {
-        "BENIGN":            (False, "normal"),
-        "DoS Hulk":          (True,  "syn_flood"),
-        "PortScan":          (True,  "port_scan"),
-        "DDoS":              (True,  "syn_flood"),
-        "DoS GoldenEye":     (True,  "slowloris"),
-        "FTP-Patator":       (True,  "brute_force"),
-        "SSH-Patator":       (True,  "brute_force"),
-        "DoS slowloris":     (True,  "slowloris"),
-        "DoS Slowhttptest":  (True,  "slowloris"),
-        "Bot":               (True,  "c2_beacon"),
-        "Web Attack":        (True,  "brute_force"),
-        "Infiltration":      (True,  "data_exfil"),
-    }
-
-    def __init__(self, data_dir: str):
-        self.data_dir = Path(data_dir)
-        self.samples: List[Tuple[np.ndarray, bool, str]] = []
-
-    def load(self, max_samples: int = 100_000) -> int:
-        """تحميل مجموعة البيانات من ملفات CSV"""
-        csv_files = list(self.data_dir.glob("*.csv"))
-        if not csv_files:
-            logger.warning(f"No CSV files found in {self.data_dir}")
-            return 0
-
-        count = 0
-        for csv_file in csv_files:
-            try:
-                with open(csv_file, "r", encoding="utf-8-sig") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        if count >= max_samples:
-                            break
-
-                        label = row.get("Label", row.get(" Label", "BENIGN")).strip()
-                        is_attack, attack_type = self.LABEL_MAP.get(
-                            label, (False, "normal")
-                        )
-
-                        features = self._row_to_features(row)
-                        if features is not None:
-                            self.samples.append((features, is_attack, attack_type))
-                            count += 1
-
-            except Exception as e:
-                logger.warning(f"Failed to load {csv_file}: {e}")
-
-        logger.info(f"Loaded {count} samples from CICIDS dataset")
-        return count
-
-    def _row_to_features(self, row: Dict) -> Optional[np.ndarray]:
-        """تحويل صف CSV إلى متجه ميزات"""
-        try:
-            f = np.zeros(82, dtype=np.float32)
-            get = lambda k, default=0.0: float(row.get(k, row.get(f" {k}", default)) or default)
-
-            f[0]  = get("Flow Duration") / 1e6     # microseconds → seconds
-            f[1]  = get("Total Fwd Packets")
-            f[2]  = get("Total Backward Packets")
-            f[3]  = get("Fwd Packet Length Mean")
-            f[4]  = get("Bwd Packet Length Mean")
-            f[5]  = get("Flow Bytes/s") / 1e6
-            f[6]  = get("Flow Packets/s")
-            f[9]  = get("Average Packet Size") / 1000
-            f[11] = get("SYN Flag Count")
-            f[12] = get("ACK Flag Count")
-            f[13] = get("FIN Flag Count")
-            f[14] = get("RST Flag Count")
-            f[15] = get("PSH Flag Count")
-            f[30] = get("Flow IAT Mean") / 1e6
-            f[31] = get("Flow IAT Std")  / 1e6
-            f[32] = get("Flow IAT Min")  / 1e6
-            f[33] = get("Flow IAT Max")  / 1e6
-
-            # Normalize
-            f = np.clip(f, -10, 10)
-            f = f / (np.abs(f).max() + 1e-8)
-
-            # GNN embedding = zeros (not available in offline dataset)
-            f[50:] = 0.0
-
-            if np.isnan(f).any() or np.isinf(f).any():
-                return None
-
-            return f
-        except Exception:
-            return None
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __iter__(self):
-        return iter(self.samples)
+    def reset_metrics(self):
+        self.true_positives = 0
+        self.true_negatives = 0
+        self.false_positives = 0
+        self.false_negatives = 0
 
 
 # ============================================================================
@@ -357,192 +270,206 @@ class CICIDSDataset:
 # ============================================================================
 
 def train(
-    protocol:     str   = "tcp",
-    epochs:       int   = 100,
-    steps_per_epoch: int = 10_000,
-    output_dir:   str   = "ml/checkpoints",
-    dataset_dir:  Optional[str] = None,
+    config: MARLConfig,
+    env: NetworkEnv,
+    epochs: int = 100,
+    steps_per_epoch: int = 10000,
+    checkpoint_dir: str = "ml/checkpoints",
     wandb_project: Optional[str] = None,
-    seed:         int   = 42,
 ) -> MetaAgent:
     """
-    حلقة التدريب الرئيسية للـ MARL
+    الحلقة الرئيسية للتدريب
 
     Args:
-        protocol:   البروتوكول المستهدف (tcp/udp/icmp)
-        epochs:     عدد حقب التدريب
+        config: إعدادات MARL
+        env: بيئة المحاكاة
+        epochs: عدد حقب التدريب
         steps_per_epoch: خطوات لكل حقبة
-        output_dir: مجلد حفظ النماذج
-        dataset_dir: مسار مجموعة بيانات CICIDS (اختياري)
-        wandb_project: اسم مشروع WandB (اختياري)
-        seed:       بذرة العشوائية
+        checkpoint_dir: مجلد حفظ النماذج
+        wandb_project: مشروع W&B (None = تعطيل)
+
+    Returns:
+        MetaAgent المدرَّب
     """
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
+    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
-    config = MARLConfig(protocols=[protocol] if protocol != "all" else ["tcp", "udp", "icmp"])
-    agent  = MetaAgent(config)
-    env    = NetworkEnv(protocol=protocol, seed=seed)
-    proto_agent = agent.protocol_agents.get(protocol, list(agent.protocol_agents.values())[0])
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    # تحميل مجموعة البيانات إذا متوفرة
-    dataset = None
-    if dataset_dir and Path(dataset_dir).exists():
-        dataset = CICIDSDataset(dataset_dir)
-        n = dataset.load()
-        if n > 0:
-            logger.info(f"Using CICIDS dataset: {n} samples")
-
-    # إعداد WandB
+    # تهيئة W&B
     if wandb_project and WANDB_AVAILABLE:
         wandb.init(
-            project  = wandb_project,
-            name     = f"thor-marl-{protocol}-{int(time.time())}",
-            config   = {
-                "protocol":        protocol,
-                "epochs":          epochs,
+            project=wandb_project,
+            name=f"thor-marl-{time.strftime('%Y%m%d-%H%M%S')}",
+            config={
+                "epochs": epochs,
                 "steps_per_epoch": steps_per_epoch,
-                "state_dim":       config.state_dim,
-                "action_dim":      config.action_dim,
-                "hidden_dim":      config.hidden_dim,
-                "learning_rate":   config.learning_rate,
-                "gamma":           config.gamma,
-            },
+                "batch_size": config.batch_size,
+                "learning_rate": config.learning_rate,
+                "gamma": config.gamma,
+            }
         )
 
+    agent = MetaAgent(config)
     best_accuracy = 0.0
-    logger.info(f"Starting MARL training: protocol={protocol}, epochs={epochs}")
+
+    logger.info(f"Starting MARL training: {epochs} epochs × {steps_per_epoch} steps")
+    logger.info(f"Device: {config.device}")
+    logger.info(f"Action space: {ACTION_SPACE}")
 
     for epoch in range(epochs):
-        # إحصاءات الحقبة
-        epoch_rewards:      List[float] = []
-        epoch_correct:      int = 0
-        epoch_total:        int = 0
-        epoch_fp:           int = 0
-        epoch_fn:           int = 0
-        epoch_tp:           int = 0
+        epoch_start = time.time()
+        env.reset_metrics()
+        total_reward = 0.0
 
-        # استخدام مجموعة البيانات أو المحاكاة
-        data_source: List[Tuple[np.ndarray, bool, str]]
-        if dataset and len(dataset) > 0:
-            # عيّنة عشوائية من مجموعة البيانات
-            indices = np.random.choice(len(dataset), size=min(steps_per_epoch, len(dataset)), replace=True)
-            data_source = [dataset.samples[i] for i in indices]
-        else:
-            # توليد مصطنع
-            data_source = [env.generate_flow() for _ in range(steps_per_epoch)]
+        for step in range(steps_per_epoch):
+            # الحصول على عينة من البيئة
+            state, is_attack, protocol = env.sample()
 
-        for state, is_attack, attack_type in data_source:
-            start_us = time.perf_counter() * 1e6
-
-            # اختيار الإجراء
-            action, log_prob, value = proto_agent.select_action(state)
-
-            latency_us = time.perf_counter() * 1e6 - start_us
+            # اختيار إجراء
+            action, confidence = agent.make_decision(state, protocol, deterministic=False)
 
             # حساب المكافأة
-            reward = env.compute_reward(action, is_attack, attack_type, latency_us)
-
-            # تتبع الدقة
-            action_name = ACTION_SPACE.get(action, "allow")
-            blocked = action_name == "block"
-
-            if is_attack and blocked:   epoch_tp += 1; epoch_correct += 1
-            elif not is_attack and not blocked: epoch_correct += 1
-            elif not is_attack and blocked: epoch_fp += 1
-            else: epoch_fn += 1
-            epoch_total += 1
+            reward = env.compute_reward(action, is_attack)
+            total_reward += reward
 
             # تخزين التجربة
-            proto_agent.store_transition(
-                state    = state,
-                action   = action,
-                reward   = reward,
-                log_prob = log_prob,
-                value    = value,
-                done     = False,
+            protocol_agent = agent.protocol_agents.get(protocol, agent.protocol_agents["tcp"])
+            _, log_prob, value = protocol_agent.network(
+                torch.FloatTensor(state).unsqueeze(0).to(torch.device(config.device))
             )
-            epoch_rewards.append(reward)
+            protocol_agent.store_transition(
+                state=state,
+                action=action,
+                reward=reward,
+                log_prob=log_prob.item(),
+                value=value.item(),
+                done=(step == steps_per_epoch - 1),
+            )
 
-        # تحديث الشبكة
-        metrics = proto_agent.update()
+            # تحديث النماذج كل batch_size خطوة
+            if (step + 1) % config.batch_size == 0:
+                for proto, proto_agent in agent.protocol_agents.items():
+                    update_metrics = proto_agent.update()
 
-        # حساب المقاييس
-        accuracy    = epoch_correct / max(epoch_total, 1)
-        avg_reward  = np.mean(epoch_rewards) if epoch_rewards else 0.0
-        fp_rate     = epoch_fp  / max(epoch_total, 1)
-        fn_rate     = epoch_fn  / max(epoch_total, 1)
-
-        proto_agent.avg_reward = avg_reward
+        # إحصاءات الحقبة
+        epoch_time = time.time() - epoch_start
+        env_metrics = env.metrics()
+        avg_reward = total_reward / steps_per_epoch
 
         logger.info(
-            f"Epoch {epoch+1}/{epochs} | "
-            f"acc={accuracy:.4f} | reward={avg_reward:.3f} | "
-            f"FP={fp_rate:.4f} FN={fn_rate:.4f} | "
-            f"steps={proto_agent.total_steps}"
+            f"Epoch {epoch+1:3d}/{epochs} | "
+            f"Reward: {avg_reward:+.2f} | "
+            f"Acc: {env_metrics['accuracy']:.3f} | "
+            f"F1: {env_metrics['f1_score']:.3f} | "
+            f"FPR: {env_metrics['fpr']:.4f} | "
+            f"Time: {epoch_time:.1f}s"
         )
 
-        # حفظ النموذج الأفضل
-        if accuracy > best_accuracy:
-            best_accuracy = accuracy
-            agent.save_all(f"{output_dir}/best")
-            logger.info(f"New best model saved (accuracy={accuracy:.4f})")
+        # W&B logging
+        if wandb_project and WANDB_AVAILABLE:
+            wandb.log({
+                "epoch": epoch + 1,
+                "avg_reward": avg_reward,
+                **{f"env/{k}": v for k, v in env_metrics.items()},
+                "time_per_epoch": epoch_time,
+            })
+
+        # حفظ أفضل نموذج
+        if env_metrics['accuracy'] > best_accuracy:
+            best_accuracy = env_metrics['accuracy']
+            agent.save_all(f"{checkpoint_dir}/best")
+            logger.info(f"  ⭐ New best accuracy: {best_accuracy:.4f}")
 
         # حفظ دوري كل 10 حقب
         if (epoch + 1) % 10 == 0:
-            agent.save_all(f"{output_dir}/epoch_{epoch+1}")
+            agent.save_all(f"{checkpoint_dir}/epoch_{epoch+1:04d}")
 
-        # إرسال إلى WandB
-        if wandb_project and WANDB_AVAILABLE:
-            log_dict = {
-                "epoch":       epoch + 1,
-                "accuracy":    accuracy,
-                "avg_reward":  avg_reward,
-                "fp_rate":     fp_rate,
-                "fn_rate":     fn_rate,
-                "total_steps": proto_agent.total_steps,
-            }
-            if metrics:
-                log_dict.update({f"loss/{k}": v for k, v in metrics.items()})
-            wandb.log(log_dict)
-
-    # حفظ النموذج النهائي
-    agent.save_all(f"{output_dir}/final")
-    logger.info(f"Training complete. Best accuracy: {best_accuracy:.4f}")
+    # حفظ النهائي
+    agent.save_all(f"{checkpoint_dir}/final")
 
     if wandb_project and WANDB_AVAILABLE:
         wandb.finish()
 
+    logger.info(f"Training complete. Best accuracy: {best_accuracy:.4f}")
     return agent
 
 
 # ============================================================================
-# CLI Entry Point
+# Evaluation
+# ============================================================================
+
+def evaluate(
+    agent: MetaAgent,
+    env: NetworkEnv,
+    n_samples: int = 10000,
+) -> Dict:
+    """تقييم الوكيل المدرَّب"""
+    logger.info(f"Evaluating agent on {n_samples:,} samples...")
+    env.reset_metrics()
+
+    for _ in range(n_samples):
+        state, is_attack, protocol = env.sample()
+        action, _ = agent.make_decision(state, protocol, deterministic=True)
+        env.compute_reward(action, is_attack)
+
+    metrics = env.metrics()
+    logger.info(f"Evaluation Results:")
+    logger.info(f"  Accuracy:  {metrics['accuracy']:.4f}")
+    logger.info(f"  Precision: {metrics['precision']:.4f}")
+    logger.info(f"  Recall:    {metrics['recall']:.4f}")
+    logger.info(f"  F1 Score:  {metrics['f1_score']:.4f}")
+    logger.info(f"  FPR:       {metrics['fpr']:.4f}")
+    logger.info(f"  FNR:       {metrics['fnr']:.4f}")
+
+    return metrics
+
+
+# ============================================================================
+# Main
 # ============================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="Train Thor MARL agents")
-    parser.add_argument("--protocol",     default="tcp",   help="tcp|udp|icmp|all")
-    parser.add_argument("--epochs",       type=int, default=100)
-    parser.add_argument("--steps",        type=int, default=10_000, dest="steps_per_epoch")
-    parser.add_argument("--output",       default="ml/checkpoints")
-    parser.add_argument("--dataset",      default=None,    help="Path to CICIDS dataset dir")
-    parser.add_argument("--wandb",        default=None,    help="WandB project name")
-    parser.add_argument("--seed",         type=int, default=42)
+    parser.add_argument("--dataset", help="Path to CICIDS2017/2018 dataset CSV files")
+    parser.add_argument("--output", default="ml/checkpoints", help="Checkpoint directory")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--steps", type=int, default=10000, help="Steps per epoch")
+    parser.add_argument("--batch-size", type=int, default=2048)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--wandb-project", help="W&B project name")
+    parser.add_argument("--eval-only", action="store_true")
+    parser.add_argument("--checkpoint", help="Load checkpoint for eval")
     args = parser.parse_args()
 
-    train(
-        protocol        = args.protocol,
-        epochs          = args.epochs,
-        steps_per_epoch = args.steps_per_epoch,
-        output_dir      = args.output,
-        dataset_dir     = args.dataset,
-        wandb_project   = args.wandb,
-        seed            = args.seed,
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s"
     )
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    config = MARLConfig(
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+    )
+
+    env = NetworkEnv(dataset_path=args.dataset, seed=args.seed)
+
+    if args.eval_only and args.checkpoint:
+        agent = MetaAgent(config)
+        agent.load_all(args.checkpoint)
+        evaluate(agent, env)
+    else:
+        agent = train(
+            config=config,
+            env=env,
+            epochs=args.epochs,
+            steps_per_epoch=args.steps,
+            checkpoint_dir=args.output,
+            wandb_project=args.wandb_project,
+        )
+        logger.info("Running final evaluation...")
+        evaluate(agent, env)
 
 
 if __name__ == "__main__":

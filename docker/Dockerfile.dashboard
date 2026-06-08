@@ -1,0 +1,27 @@
+# Thor Firewall — Dashboard Container (Multi-stage)
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+COPY dashboard/package.json dashboard/pnpm-lock.yaml* ./
+
+RUN corepack enable && pnpm install --frozen-lockfile 2>/dev/null || npm install
+
+COPY dashboard/ .
+
+RUN npm run build
+
+# ===== Runtime (nginx) =====
+FROM nginx:1.25-alpine AS runtime
+
+LABEL org.opencontainers.image.title="Thor Firewall Dashboard"
+LABEL org.opencontainers.image.licenses="MIT"
+
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+COPY docker/nginx.conf /etc/nginx/nginx.conf
+
+EXPOSE 80
+
+HEALTHCHECK --interval=10s --timeout=5s \
+    CMD wget -qO- http://localhost/ || exit 1

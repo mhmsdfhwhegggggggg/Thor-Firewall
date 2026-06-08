@@ -1,295 +1,94 @@
-# Thor Firewall — Changelog
+# Changelog — Thor Firewall
+# سجل التغييرات
 
-All notable changes are documented here.
-Format: [version] — date — summary
+All notable changes to Thor Firewall will be documented in this file.
 
----
-
-## [0.2.0] — 2026-06-07 — Phase 2: Enterprise-Grade Intelligence & Cross-Platform
-
-### Added
-
-#### Windows WFP Complete Interface (`agent/src/windows/wfp_io.rs`)
-- Full Named Pipe connection lifecycle (CreateFileW + WaitNamedPipeW with timeout)
-- Shared memory ring buffer reader with atomic head/tail — zero-copy packet access
-- `WfpPacketEntry` (C-compatible 1472-byte struct) aligned with ThorCallout.sys layout
-- Kernel event object (WaitForSingleObject) for efficient packet-ready notification
-- `send_verdict()` — async verdict via Named Pipe with length-prefix framing
-- `update_blacklist()` — CIDR block/unblock directly in kernel callout
-- `run_packet_loop()` — async tokio task draining ring buffer until shutdown
-- `WfpPacketEntry::to_parsed_packet()` — FILETIME→Unix ns conversion + full ParsedPacket
-- Driver command protocol: `DriverCommand` / `DriverResponse` (serde_json over Pipe)
-- Cross-compilation stubs for non-Windows (bail! with clear error)
-- Per-instance atomic counters: `packets_received`, `packets_blocked`
-
-#### Complete gRPC Server — tonic (`agent/src/server.rs`)
-- `ThorAgent` service: all 8 RPCs fully implemented
-  - `GetStats` — network + ML + system stats with /proc/self/statm memory
-  - `ApplyDecision` — external decision → event bus publish
-  - `UpdateBlacklist` / `UpdateWhitelist` — CIDR validation + BPF delegation
-  - `StreamEvents` — tokio broadcast channel, risk + type filters
-  - `SendTrainingBatch` — queue to Redis stream
-  - `UpdateConfig` — runtime parameter validation
-  - `HealthCheck` — Kubernetes liveness compatible
-- `ThorMLInference` service: both RPCs implemented
-  - `Analyze` — single flow with latency measurement
-  - `AnalyzeBatch` — up to 1024 flows, parallel tokio::spawn
-- `EventBus` — tokio broadcast (4096 capacity) for StreamEvents fan-out
-- `auth_interceptor` — Bearer token + dev-mode bypass
-- mTLS support: Identity + client CA root (mutual TLS)
-- gRPC reflection service (grpcurl/grpcui compatible)
-- Connection settings: keepalive 30s, concurrency limit 256/conn
-
-#### `agent/build.rs` — tonic-build Proto Codegen
-- Compiles `agent/proto/thor.proto` → Rust structs + service traits
-- Enables serde derive on all generated types
-- Outputs `thor_descriptor.bin` for gRPC reflection
-- `cargo:rerun-if-changed` for incremental builds
-
-#### ClickHouse Forensics Service (`control-plane/src/services/clickhouse.py`)
-- Schema DDL: `thor_flows`, `thor_threats`, `thor_decisions`, `thor_stats_1m`
-- Materialized View: `thor_flows → thor_stats_1m` (auto-aggregation)
-- All tables: TTL (30/90/365 days), partition by date, MergeTree ordered indices
-- `SummingMergeTree` for 1-minute stats auto-merge
-- Buffered batch insertion: `insert_flow/threat/decision` → auto-flush at 5K rows or 2s
-- Background `_flush_loop` asyncio task
-- Query methods: `query_flows`, `query_threats`, `query_timeline`, `query_top_talkers`
-- `query_attack_heatmap` — country × threat_type with JOIN
-- `search_ip` — parallel asyncio.gather (flows + threats) for IP investigation
-- `export_csv` — raw ClickHouse FORMAT CSVWithNames for SIEM export
-- Singleton `init_clickhouse()` with graceful degradation if CH unavailable
-
-#### Forensics API Routes (`control-plane/src/routes/forensics.py`)
-- `GET /forensics/flows` — multi-filter: time, src_ip, dst_ip, port, protocol, risk, decision
-- `GET /forensics/threats` — severity, threat_type, MITRE tactic filters
-- `GET /forensics/timeline` — 1m/5m/15m/1h/1d granularity time series
-- `GET /forensics/top-talkers` — by bytes|packets|flows
-- `GET /forensics/attack-heatmap` — geographic attack distribution
-- `GET /forensics/ip/{ip}` — full IP investigation with verdict (CLEAN/LOW/MEDIUM/HIGH_RISK)
-- `POST /forensics/hunt` — IoC hunting: up to 1000 IPv4/CIDR indicators in parallel
-- `GET /forensics/export/{table}` — CSV download with SIEM-friendly filename
-- `GET /forensics/health` — ClickHouse connectivity check
-- Full input validation: IP addresses, time ranges, table names, granularity enum
-
-#### IPv6 Full Support (`kernel-modules/linux/ebpf/xdp_ipv6.c`)
-- `ipv6_blacklist` / `ipv6_whitelist` LPM trie maps (128-bit prefix, 65K/16K entries)
-- `ipv6_flow_table` LRU_HASH (500K concurrent IPv6 flows)
-- `icmpv6_rate_limit` LRU_HASH (200 pkt/s per source, 1s sliding window)
-- Extension header parser: HOP, ROUTING, FRAGMENT, AUTH, DEST — up to 8 headers
-- Fragment → pass to kernel reassembly (not dropped)
-- ICMPv6 policy: NDP (133-137) + MLD (130-132, 143) always PASS; Echo rate-limited
-- `ipv6_emit_sample()` — ring buffer samples for sensitive ports + SYN-only flows
-- `thor_tc_ipv6_egress` TC hook — egress blacklist/whitelist enforcement
-- Standalone `thor_xdp_ipv6` XDP program + callable inline from `xdp_main.c`
-
-### Changed
-
-- `CHANGELOG.md` — Phase 2 documentation
-- `docs/architecture/PHASE2.md` — full architecture, benchmarks, roadmap to Phase 3
-
-### Performance (Phase 2)
-
-| Component | Metric | Value |
-|-----------|--------|-------|
-| gRPC GetStats | P99 latency | < 500µs |
-| gRPC StreamEvents | Fan-out latency | < 1ms |
-| AnalyzeBatch 1024 | Total time | < 5ms |
-| XDP IPv6 parsing | Per-packet | < 20ns |
-| IPv6 LPM lookup | Worst-case | < 30ns |
-| ClickHouse flush | Batch 5K rows | < 100ms |
-| IoC Hunt 100 IPs | Parallel | < 2s |
-| WFP read_packet | Ring buffer | < 1µs |
-| WFP send_verdict | Named Pipe | < 2µs |
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [0.1.0] — 2026-06-07 — Phase 1: Production-Grade Core
+## [Unreleased]
 
-### Added
+### Phase 0 — Infrastructure (Months 1-3) 🔄
 
-#### eBPF Dataplane
-- `xdp_loader.rs` — Aya BPF loader: CIDR LPM trie blacklist/whitelist, ring buffer reader
-  (1024 events/poll), percpu stats aggregation, flow decision maps
-- `ring_consumer.rs` — PacketSample aligned with thor_common.h, batch processing
-  (128 pkts/batch), async RL inference pipeline
-
-#### Control Plane
-- `analytics.py` — real-time stats, time-series, top-talkers, ML metrics
-- `threats.py` — threat events API, Redis pub/sub, MITRE ATT&CK linking
-- `query.py` — LLM proxy with offline demo mode and pre-built security answers
-
-#### React Dashboard
-- `RealTimeStats.tsx` — 3-row stats + AI accuracy bars + decision summary
-- `FlowTable.tsx` — sortable/filterable, risk badges, detail panel
-- `ThreatFeed.tsx` — live cards, severity gradients, MITRE links
-- `ThroughputChart.tsx` — Recharts 60s rolling window, real-time updates
-
-#### ML Training
-- `train_marl.py` — complete PPO loop, 9-attack NetworkEnv, CICIDS2017/2018
-  CSV loader, WandB integration, CLI
-
-#### Documentation
-- `PHASE1.md` — full architecture, BPF map reference, API table, perf benchmarks
-
----
-
-## [0.0.1] — 2026-06-06 — Phase 0: Infrastructure
-
-### Added
-- Rust workspace (agent-core, agent, thor-common)
-- eBPF skeleton programs (xdp_main.c, xdp_syn_flood.c, xdp_conntrack.c, tc_egress.c, lsm_probe.c)
-- FastAPI control plane skeleton (app.py, all route files)
-- React + Vite + Recharts + Tailwind dashboard skeleton
-- Docker + Docker Compose + Kubernetes manifests
-- CI/CD pipeline (GitHub Actions)
-- Proto definition (thor.proto — complete)
-- ML stubs (MARL agents, GNN, LLM)
-
----
-
-## [0.3.0] — 2026-06-07 — Phase 3: Operational Completeness & Global Intelligence
-
-### Added
-
-#### Docker Compose Production Stack (`docker-compose.yml` — 385 lines)
-- 8 services: thor-agent, control-plane, ml-inference, clickhouse, redis, dashboard, prometheus, grafana
-- thor-agent: hostNetwork + CAP_NET_ADMIN/BPF/SYS_ADMIN + ulimits memlock=-1 + BPF fs mount
-- ml-inference: GPU support (NVIDIA device plugin), 4GB RAM limit, 60s startup probe
-- ClickHouse: 24.3-alpine, named volumes (bind-mount to DATA_DIR)
-- Redis 7.2: maxmemory LRU + AOF persistence + requirepass
-- Grafana: pre-provisioned datasources + clickhouse plugin + worldmap
-- Networks: thor-internal (172.20.0.0/24) + thor-frontend (172.20.1.0/24)
-- Volumes: thor-models (bind), thor-clickhouse-data (bind), thor-redis-data (bind)
-
-#### Kubernetes Manifests (`k8s/` — 458 lines total)
-- `k8s/agent/daemonset.yaml` — DaemonSet: hostNetwork, hostPID, system-node-critical priority, init BPF loader, HPA-safe (tolerations: Exists)
-- `k8s/control-plane/deployment.yaml` — 3 replicas, HPA (3-12, CPU 70%), RollingUpdate, Ingress + cert-manager TLS
-- `k8s/clickhouse/statefulset.yaml` — StatefulSet, 500Gi PVC (fast-ssd), liveness/readiness via clickhouse-client
-- `k8s/namespace.yaml` — Namespace + ResourceQuota (32 CPU / 64Gi) + NetworkPolicy (default-deny + allow-internal)
-- All manifests: ServiceAccount, Service (Headless for agent), Ingress
-
-#### Threat Intelligence Service (`control-plane/src/services/threat_intel.py` — 670 lines)
-- 5 free feeds: Emerging Threats (compromised + botcc), Feodo Tracker, ThreatFox, CINS Army
-- Feed refresh loop: every 6h, Redis SADD + HSET for O(1) IP lookup
-- MISP integration: REST API with Attribute restSearch, tag extraction
-- AlienVault OTX integration: pulse_count→score, country, threat_types
-- AbuseIPDB integration: confidence score, tor exit, ISP/ASN
-- `lookup_ip`: 3-tier cache (in-memory L1 → Redis L2 → live L3)
-- `enrich_flow`: parallel src_ip + dst_ip lookup
-- `export_stix_bundle`: STIX 2.1 bundle with indicators, kill_chain_phases, external_references
-- Private range exclusion (RFC1918, loopback, IPv6 ULA)
-- `get_reputation_batch`: parallel asyncio.gather for bulk lookups
-
-#### Updated Control Plane (`control-plane/src/main.py` — 216 lines)
-- ClickHouseConfig from environment variables + `init_clickhouse()` at startup
-- ThreatIntelService startup with MISP/OTX/AbuseIPDB config
-- Forensics router registered (GET /forensics/*)
-- Prometheus instrumentator: exclude /health + /metrics endpoints
-- Version bump to 0.3.0 in FastAPI metadata
-
-#### Federated Learning Framework (`ml/federated/fed_learning.py` — 623 lines)
-- `FederatedServer`: FedAvg aggregation, round management, checkpoint save/load
-- `FederatedClient`: full round lifecycle (fetch → local train → delta → send)
-- `DPSGDEngine`: gradient clipping (L2 norm ≤ C), Gaussian noise addition, ε accountant
-- FedProx proximal term: prevents client drift (μ=0.01)
-- Sparsification: keeps only |delta_ij| > 0.001 (reduces bandwidth 70-95%)
-- FastAPI router: /federated/model, /federated/update, /federated/metrics, /federated/status
-- CLI: `python -m ml.federated.fed_learning --client-id x --server-url y --rounds 10`
-
-### Phase 3 Metrics
-
-| Component | Lines | Key Capability |
-|-----------|-------|---------------|
-| docker-compose.yml | 385 | 8-service production stack |
-| k8s/*.yaml | 458 | DaemonSet + HPA + StatefulSet |
-| threat_intel.py | 670 | 5 feeds + MISP + OTX + STIX 2.1 |
-| fed_learning.py | 623 | FedAvg + DP-SGD + FedProx |
-| main.py | 216 | All services wired |
+#### Added
+- Complete project structure with monorepo layout
+- Rust workspace (`Cargo.toml`) with all core dependencies pinned
+- `thor-agent` binary crate with CLI interface (clap)
+- `PacketParser` — high-performance packet parser with SIMD support
+  - IPv4/IPv6/TCP/UDP/ICMP support
+  - Shannon entropy calculation for payload analysis
+  - 50-feature ML vector extraction
+  - Canonical flow key normalization
+- `FlowManager` — lock-free concurrent flow state management
+  - DashMap-based hash table (1M flows per CPU core)
+  - Welford's online algorithm for running statistics
+  - Background cleanup for expired flows
+  - Direct BPF map update interface
+- `RLCore` — batched inference bridge (Rust → Python)
+  - Configurable batch size and timeout
+  - Support for: in-process (PyO3), REST API, and simulation modes
+  - Async tokio-based request handling
+- eBPF/XDP kernel programs:
+  - `xdp_main.c` — main XDP entry point with multi-stage pipeline
+  - `xdp_syn_flood.c` — advanced SYN flood protection with token bucket rate limiting
+  - `thor_common.h` — shared kernel/userspace data structures
+  - `Makefile` — automated build and BPF verifier check
+- XDP Loader (`agent/src/linux/xdp_loader.rs`) using `aya` crate
+- MARL Engine (`ml/marl/agents.py`):
+  - `ActorCriticNetwork` with ResidualBlock layers
+  - `ProtocolAgent` (TCP/UDP/ICMP specialization)
+  - `MetaAgent` centralized coordinator
+  - `ExperienceBuffer` with GAE advantage computation
+  - PPO training loop with gradient clipping
+- GNN Analyzer (`ml/gnn/network_analyzer.py`):
+  - `NodeFeatureExtractor` — 32-dim per-device features
+  - `ThorGNN` — GraphSAGE + GATv2 architecture
+  - `NetworkGraphBuilder` — real-time graph updates
+  - Whole-network threat detection
+- LLM Explainer (`ml/llm/explainer.py`):
+  - `SecurityExplainer` — Mistral-7B-Security interface
+  - `ThreatIntelRAG` — MISP/OTX/CVE context retrieval
+  - Arabic/English explanation generation
+  - Fallback when LLM server unavailable
+- Control Plane (FastAPI):
+  - `/api/health` — health checks (Redis, ClickHouse, agents)
+  - `/api/v1/flows` — flow listing with filtering and pagination
+  - `/api/v1/rules` — CRUD for firewall rules
+  - `/api/v1/threats` — threat event listing and summary
+  - `/api/v1/analytics/network` — real-time network statistics
+  - `/api/v1/analytics/system` — agent resource usage
+  - `/api/v1/query` — natural language security queries (LLM)
+  - `/ws/live` — WebSocket real-time event stream
+  - ConnectionManager + EventBus for real-time updates
+- Docker infrastructure:
+  - `Dockerfile.agent` — multi-stage minimal runtime image
+  - `docker-compose.yml` — full stack (Redis, ClickHouse, control-plane, dashboard, LLM, monitoring)
+- CI/CD Pipelines:
+  - `ci.yml` — Rust tests, Python tests, eBPF build, benchmarks, Docker push
+  - `security.yml` — cargo-audit, pip-audit, CodeQL, Trivy container scan, Gitleaks
+  - `dependabot.yml` — automated dependency updates (Cargo, pip, GitHub Actions)
+- GitHub templates:
+  - Bug report template (YAML)
+  - Feature request template (YAML)
+  - Pull request template with performance impact table
+- Documentation:
+  - `README.md` — comprehensive project overview with architecture diagram
+  - `docs/architecture/ARCHITECTURE.md` — detailed architecture with data flow diagrams
+  - `CONTRIBUTING.md` — full contributor guide with standards
+  - `configs/agent.default.toml` — documented default configuration
 
 ---
 
-## [0.4.0] — 2026-06-07 — Phase 4: Production REST ML Client + Self-Healing Agent
+## Roadmap
 
-### Changed
-
-#### Complete `agent/src/rl_core.rs` (635 lines — replaces stub)
-- `call_rest_api`: real reqwest HTTP client
-  - POST `{ML_URL}/v1/analyze/batch` with JSON payload
-  - MLBatchRequest/Response typed serde structs
-  - Exponential backoff retry (2 retries, 50/100/200ms delays)
-  - Handles: timeout, connect failure, 429/503 server errors
-  - Graceful fallback: simulation on any failure (never blocks traffic)
-  - Connection pooling: pool_max_idle_per_host=8, tcp_keepalive=30s
-- `analyze_raw`: new method for gRPC AnalyzeBatch — takes &[f32] features directly
-- `call_python_model`: PyO3 feature-gated, graceful fallback if not compiled
-- FlowKey::zero() stub for cases where flow_key is unavailable in raw calls
-- Improved simulation heuristics: 5 patterns (SYN-only, port scan, high-entropy C2, exfiltration, bot-speed)
-- EMA latency tracking: 99% old + 1% new per batch
-- Stats: added http_errors + http_fallbacks counters
-
----
-
-## [0.5.0] — 2026-06-07 — Phase 5: Production Completeness (Fixes Report Issues)
-
-> تحويل الـ stubs والبيانات الوهمية إلى تنفيذ حقيقي كامل
-
-### Fixed
-
-#### `ml/serving/inference_server.py` (592 lines) — was: `explanation=None`
-- `generate_explanation()`: شرح حقيقي بـ 3 مستويات:
-  1. Ollama REST API (Mistral-7B محلي) للتدفقات ذات risk > 0.6
-  2. محرك قواعد محلي (5 أنماط: SYN flood, port scan, high-entropy C2, exfiltration, bot-speed)
-  3. Fallback دائم — لا تعيد `None` أبداً
-- `/v1/analyze/batch` endpoint مُضاف (alias لـ `/infer/batch`) — يتوافق مع `rl_core.rs`
-- `analyze_batch_sync()` لـ PyO3 InProcess mode — يعيد explanations حقيقية
-- GNN embedding يُدمج فعلياً في القرار (concat [50 + 32])
-- Prometheus metrics: INFER_LATENCY histogram, INFER_COUNTER, ACCURACY_GAUGE
-- Hot-reload: `/model/reload` يمسح explanation cache
-
-#### `control-plane/src/routes/query.py` (382 lines) — was: hardcoded DEMO_ANSWERS
-- لا DEMO_ANSWERS — كل الإجابات من بيانات حقيقية أو LLM
-- `_build_network_context()`: RAG حقيقي من Redis (stats, threats, top IPs, BPF counters)
-- `_query_ollama()`: Ollama REST API (Mistral-7B) — أولوية أولى
-- `_query_groq()`: Groq Cloud fallback (إذا GROQ_API_KEY متاح)
-- `_context_aware_fallback()`: يبني إجابة من بيانات Redis الحقيقية (لا hardcoded)
-- Streaming support: `/query` مع `stream: true` → SSE من Ollama
-
-#### `control-plane/src/routes/websocket.py` (389 lines) — was: `import random` throughout
-- ❌ حذف `import random` وكل `random.randint/random.uniform` 
-- `_read_live_stats()`: يقرأ من Redis pipeline واحدة (6 keys في طلب واحد)
-  - `thor:stats:current`, `thor:bpf:counters`, `thor:ml:stats`, `thor:agent:health`
-- `_threat_push_loop()`: Redis Pub/Sub على `thor:pubsub:events` — أحداث فورية
-- Back-pressure: يرسل diff فقط (لا يُعيد إرسال بيانات ثابتة)
-- Heartbeat كل 30 ثانية (كان 60)
-- الأحداث التاريخية: يُرسل آخر 5 تهديدات عند الاتصال
-
-#### `kernel-modules/windows/wfp/callout_driver.c` (1038 lines) — was: EMPTY FILE
-- `DriverEntry()`: إنشاء Device Object + Symbolic Link + dispatch routines
-- `ThorInitWfp()`: تسجيل 4 callouts: ALE_AUTH_RECV_ACCEPT_V4/V6 + ALE_FLOW_ESTABLISHED_V4/V6
-- `ThorClassifyV4/V6()`: Classify functions حقيقية مع blacklist/whitelist lookup
-- `ThorNotify()`: Notify function لإشعارات Filter
-- `ThorFlowDelete()`: cleanup flow context
-- Ring Buffer (8 MB, 32K entries): shared memory مع user-mode بـ zero-copy
-  - THOR_RING_HEADER + THOR_RING_ENTRY: timestamp_ns, IPs, ports, protocol, verdict, flow_id
-  - `IOCTL_THOR_MAP_RING`: تعيين Ring Buffer في user space
-- IOCTL interface: GET_STATS, BLOCK_IP, UNBLOCK_IP, WHITELIST_IP, SET_MODE, MAP_RING
-- `IP_HASH_ENTRY`: blacklist/whitelist entries مع RTL_HASHTABLE
-- `ThorDriverUnload()`: cleanup كامل (WFP unregister + ring buffer free + device delete)
-
-#### `agent/src/stats_publisher.rs` (NEW — 210 lines)
-- `run_stats_publisher()`: background task يقرأ BPF counters كل 1s ويكتبها لـ Redis
-- يكتب: `thor:stats:current`, `thor:bpf:counters`, `thor:ml:stats`, `thor:agent:health`
-- TTL تلقائي 10 ثوانٍ لكل key
-- `publish_threat_event()`: يكتب للـ list التاريخي + sorted set + Pub/Sub channel
-- `publish_flow_blocked()`: يكتب أحداث الحظر للـ WebSocket clients
-- `read_cpu_usage()` و`read_memory_usage_mb()` من `/proc/self/stat`
-
-### Summary
-
-| الملف | الحالة السابقة | الحالة الجديدة |
-|-------|--------------|--------------|
-| inference_server.py | `explanation=None` دائماً | Ollama LLM + rule-based explanation |
-| query.py | DEMO_ANSWERS hardcoded | RAG حقيقي + Ollama + Groq |
-| websocket.py | `random.randint()` | Redis BPF counters حقيقية |
-| callout_driver.c | ملف **فارغ** | WFP driver كامل (1038 سطر) |
-| stats_publisher.rs | غير موجود | Redis publisher لكل الـ stats |
+| Version | Phase | ETA |
+|---------|-------|-----|
+| 0.1.0 | Phase 0 — Infrastructure | Month 3 |
+| 0.2.0 | Phase 1 — eBPF/WFP Core | Month 9 |
+| 0.3.0 | Phase 2 — AI/ML Engine | Month 18 |
+| 0.4.0 | Phase 3 — Self-Protection | Month 24 |
+| 0.5.0 | Phase 4 — Dashboard | Month 28 |
+| 1.0.0 | Phase 5 — Production Ready | Month 36 |
+| 2.0.0 | Phase 6 — Enterprise | Month 48 |

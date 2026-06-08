@@ -1,0 +1,134 @@
+groups:
+  - name: thor_firewall_alerts
+    interval: 30s
+    rules:
+
+      # ===== Performance Alerts =====
+
+      - alert: ThorHighPacketDrop
+        expr: |
+          rate(thor_xdp_actions_total{action="drop"}[5m]) /
+          rate(thor_packets_total[5m]) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+          component: xdp
+        annotations:
+          summary: "High XDP drop rate ({{ $value | humanizePercentage }})"
+          description: >
+            Thor is dropping >50% of packets on {{ $labels.instance }}.
+            This may indicate a DoS attack or misconfigured rules.
+          runbook: https://docs.thor-firewall.io/runbooks/high-drop-rate
+
+      - alert: ThorMLLatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            rate(thor_ml_inference_duration_seconds_bucket[5m])
+          ) * 1e6 > 200
+        for: 5m
+        labels:
+          severity: warning
+          component: ml
+        annotations:
+          summary: "ML P99 latency > 200μs ({{ $value | humanize }}μs)"
+          description: "ML inference is slow on {{ $labels.instance }}"
+
+      - alert: ThorFlowTableFull
+        expr: thor_flow_table_utilization > 0.9
+        for: 1m
+        labels:
+          severity: critical
+          component: agent
+        annotations:
+          summary: "Flow table >90% full"
+          description: >
+            The BPF flow table is nearly full on {{ $labels.instance }}.
+            LRU eviction may cause missed threat detection.
+
+      # ===== Threat Alerts =====
+
+      - alert: ThorCriticalThreatDetected
+        expr: increase(thor_threat_events_total{severity="critical"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: detection
+        annotations:
+          summary: "CRITICAL threat detected — {{ $value }} events in 5m"
+          description: >
+            Critical security threat detected on {{ $labels.instance }}.
+            Immediate investigation required.
+
+      - alert: ThorSynFloodOngoing
+        expr: |
+          increase(thor_threat_events_total{threat_type="syn-flood"}[1m]) > 1000
+        for: 30s
+        labels:
+          severity: critical
+          component: detection
+        annotations:
+          summary: "SYN flood in progress ({{ $value }} events/min)"
+
+      - alert: ThorHighThreatRate
+        expr: rate(thor_threat_events_total[5m]) > 100
+        for: 2m
+        labels:
+          severity: warning
+          component: detection
+        annotations:
+          summary: "High threat event rate ({{ $value | humanize }}/s)"
+
+      # ===== System Alerts =====
+
+      - alert: ThorAgentDown
+        expr: up{job="thor-agent"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: agent
+        annotations:
+          summary: "Thor Agent is DOWN on {{ $labels.instance }}"
+          description: "The enforcement agent is unreachable — network protection may be inactive"
+
+      - alert: ThorControlPlaneDown
+        expr: up{job="thor-control-plane"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: control-plane
+        annotations:
+          summary: "Control Plane is DOWN"
+
+      - alert: ThorMLAccuracyDrop
+        expr: thor_ml_accuracy < 0.99
+        for: 10m
+        labels:
+          severity: warning
+          component: ml
+        annotations:
+          summary: "ML accuracy dropped to {{ $value | humanizePercentage }}"
+          description: >
+            Model accuracy below 99% for 10 minutes.
+            Consider retraining or reverting to previous checkpoint.
+
+      # ===== Recording Rules (for efficiency) =====
+
+  - name: thor_recording_rules
+    interval: 60s
+    rules:
+      - record: thor:packets_per_second:5m
+        expr: sum(rate(thor_packets_total[5m]))
+
+      - record: thor:blocked_rate:5m
+        expr: |
+          sum(rate(thor_blocked_flows_total[5m])) /
+          sum(rate(thor_packets_total[5m]))
+
+      - record: thor:threat_rate:1h
+        expr: sum(increase(thor_threat_events_total[1h])) by (threat_type, severity)
+
+      - record: thor:ml_p99_latency_us:5m
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(thor_ml_inference_duration_seconds_bucket[5m])) by (le)
+          ) * 1e6

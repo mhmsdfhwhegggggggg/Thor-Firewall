@@ -1,0 +1,207 @@
+# Thor Firewall Agent — Production Configuration
+# إعدادات وكيل Thor لبيئة الإنتاج
+#
+# نسخ هذا الملف إلى: /etc/thor/agent.toml
+# التوثيق: docs/configuration.md
+
+# ============================================================================
+# [agent] — إعدادات الوكيل الرئيسية
+# ============================================================================
+[agent]
+id          = "thor-agent-01"          # معرف فريد لهذا الوكيل
+name        = "Thor Firewall Node 1"   # اسم قابل للقراءة
+datacenter  = "dc-primary"            # مركز البيانات
+version     = "0.3.0"
+log_level   = "info"                   # error | warn | info | debug | trace
+dry_run     = false                    # إذا true: يسجّل فقط ولا يحظر
+
+# ============================================================================
+# [network] — إعدادات الشبكة وeBPF
+# ============================================================================
+[network]
+interface    = "eth0"                  # واجهة الشبكة (Linux)
+xdp_mode     = "skb"                  # skb | drv | hw
+tc_egress    = true                    # فحص حركة المرور الصادرة
+lsm_enabled  = true                   # Linux Security Module hooks
+
+# معدل الـ SYN flood: الحد الأقصى لحزم SYN لكل IP في الثانية
+syn_rate_limit    = 10000
+
+# حجم جدول التدفقات (Flow State Table) في kernel
+flow_table_size   = 1_000_000         # 1M تدفق
+
+# حجم Ring Buffer لنقل العينات إلى user-space
+ring_buffer_pages = 512               # 512 × 4KB = 2MB
+
+# عينة عشوائية: 1 من كل N حزمة للتحليل العميق
+sample_rate = 1                        # 1 = كل الحزم (للشبكات < 10Gbps)
+
+# ============================================================================
+# [grpc] — خادم gRPC
+# ============================================================================
+[grpc]
+addr            = "0.0.0.0:50051"
+max_connections = 1000
+tls_enabled     = false               # true في الإنتاج مع شهادات
+tls_cert_path   = "/etc/thor/tls/server.crt"
+tls_key_path    = "/etc/thor/tls/server.key"
+
+# ============================================================================
+# [control_plane] — الاتصال بـ Control Plane
+# ============================================================================
+[control_plane]
+url             = "http://localhost:8080"
+api_key         = ""                  # يُقرأ من THOR_AGENT_API_KEY
+heartbeat_secs  = 10
+reconnect_delay = 5
+
+# ============================================================================
+# [ml] — محرك التعلم الآلي
+# ============================================================================
+[ml]
+enabled         = true
+checkpoint_path = "ml/checkpoints/latest.pt"
+gpu_enabled     = false               # true إذا توفر CUDA
+inference_batch = 64                  # حجم الدُفعة للاستنتاج
+
+# عنوان خادم الاستنتاج المنفصل (اختياري)
+inference_server_url = "http://localhost:8082"
+
+# تفعيل التعلم الآلي للقرارات الفورية
+enforce_ml_decisions = true
+
+# الحد الأدنى للثقة قبل تطبيق قرار ML
+min_confidence = 0.70
+
+# ============================================================================
+# [brain] — AI Decision Engine
+# ============================================================================
+[brain]
+# نافذة التحليل السلوكي (دقائق)
+behavioral_window_min  = 60
+
+# الحد الأدنى للعينات قبل الحكم السلوكي
+behavioral_min_samples = 30
+
+# نافذة ربط التهديدات (ثوانٍ)
+correlation_window_s   = 300
+
+# الحد الأدنى لأحداث attack chain قبل رفع الدرجة
+correlation_min_events = 3
+
+# معدل التلوث لكاشف Zero-Day (1% من التدفقات متوقعة شذوذ)
+zero_day_contamination = 0.01
+
+# نقاط عتبة القرار (يمكن تعديلها حسب سياسة المؤسسة)
+threshold_critical = 0.90
+threshold_high     = 0.72
+threshold_medium   = 0.45
+threshold_low      = 0.20
+
+# ============================================================================
+# [policy] — محرك السياسات
+# ============================================================================
+[policy]
+default_action      = "allow"         # allow | block
+policy_file         = "/etc/thor/policies/default.json"
+geo_block_enabled   = true
+
+# الدول المحظورة مبدئياً (يمكن تعديلها)
+# geo_block_countries = ["KP", "IR"]   # غير مفعّل مبدئياً
+
+# ============================================================================
+# [threat_intel] — استخبارات التهديدات
+# ============================================================================
+[threat_intel]
+enabled          = true
+update_interval  = 900               # ثانية (15 دقيقة)
+
+# AlienVault OTX
+otx_api_key      = ""                # يُقرأ من THOR_OTX_API_KEY
+
+# AbuseIPDB
+abuseipdb_key    = ""
+
+# MISP
+misp_url         = ""
+misp_api_key     = ""
+
+# Feodo Tracker (مجاني)
+feodo_enabled    = true
+
+# TOR Exit Nodes
+tor_enabled      = true
+
+# ============================================================================
+# [soar] — الاستجابة الآلية للحوادث
+# ============================================================================
+[soar]
+enabled      = true
+dry_run      = false                 # true: لا تنفيذ فعلي
+
+# إشعارات
+slack_webhook   = ""                # THOR_SLACK_WEBHOOK
+siem_url        = ""
+ticket_url      = ""
+
+# خطة الاستجابة التلقائية حسب مستوى الخطورة
+[soar.auto_response]
+critical  = ["block_src_ip", "quarantine_host", "alert_soc_team", "capture_pcap_evidence", "create_threat_ioc", "create_incident_ticket"]
+high      = ["block_src_ip", "alert_soc_team", "create_threat_ioc"]
+medium    = ["throttle_ip", "alert_soc_team"]
+low       = ["log"]
+
+# ============================================================================
+# [metrics] — Prometheus Metrics
+# ============================================================================
+[metrics]
+enabled   = true
+port      = 9090
+path      = "/metrics"
+
+# ============================================================================
+# [telemetry] — OpenTelemetry Tracing
+# ============================================================================
+[telemetry]
+enabled            = false
+otlp_endpoint      = "http://localhost:4317"
+service_name       = "thor-agent"
+sampling_rate      = 0.01            # 1% في الإنتاج
+
+# ============================================================================
+# [storage] — التخزين والاستمرارية
+# ============================================================================
+[storage]
+# Redis للحالة الفورية والقرارات السريعة
+redis_url           = "redis://localhost:6379/0"
+redis_max_pool      = 50
+
+# ClickHouse للتحليلات التاريخية
+clickhouse_url      = "http://localhost:8123"
+clickhouse_db       = "thor"
+clickhouse_user     = "default"
+clickhouse_password = ""             # يُقرأ من THOR_CH_PASSWORD
+
+# مدة الاحتفاظ بالبيانات (أيام)
+flow_retention_days    = 30
+threat_retention_days  = 365
+alert_retention_days   = 90
+
+# ============================================================================
+# [performance] — ضبط الأداء
+# ============================================================================
+[performance]
+# عدد خيوط Tokio runtime
+worker_threads    = 0              # 0 = تلقائي (عدد CPU cores)
+
+# حجم Queue للحزم بين XDP consumer وML engine
+packet_queue_size = 10_000
+
+# حجم cache القرارات السريعة (عدد التدفقات)
+decision_cache_size = 100_000
+
+# مهلة انتهاء cache للتدفقات الطبيعية (ثوانٍ)
+cache_ttl_clean   = 5
+
+# مهلة انتهاء cache للتهديدات (أقصر — لإعادة الفحص)
+cache_ttl_threat  = 0.5

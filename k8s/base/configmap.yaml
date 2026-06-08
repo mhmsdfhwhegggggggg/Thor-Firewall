@@ -1,0 +1,97 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: thor-config
+  namespace: thor-firewall
+data:
+  THOR_LOG_LEVEL: "info"
+  THOR_METRICS_PORT: "9090"
+  THOR_GRPC_PORT: "50051"
+  CLICKHOUSE_HOST: "clickhouse"
+  CLICKHOUSE_PORT: "8123"
+  CLICKHOUSE_DB: "thor"
+  REDIS_URL: "redis://redis:6379/0"
+  ML_INFERENCE_URL: "http://ml-serving:8001"
+  ML_BATCH_SIZE: "64"
+  XDP_MODE: "drv"
+  SYN_RATE_LIMIT: "10000"
+  SAMPLE_RATE: "1"
+  TC_EGRESS_ENABLED: "true"
+  THREAT_INTEL_INTERVAL: "900"
+  THOR_USE_GPU: "false"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: thor-firewall
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    rule_files:
+      - "/etc/prometheus/rules/*.yaml"
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets: ["alertmanager:9093"]
+
+    scrape_configs:
+      - job_name: "thor-agent"
+        static_configs:
+          - targets: ["thor-agent:9090"]
+        relabel_configs:
+          - source_labels: [__address__]
+            target_label: instance
+
+      - job_name: "thor-control-plane"
+        static_configs:
+          - targets: ["control-plane:9091"]
+
+      - job_name: "thor-ml-serving"
+        static_configs:
+          - targets: ["ml-serving:9092"]
+
+      - job_name: "clickhouse"
+        static_configs:
+          - targets: ["clickhouse-exporter:9116"]
+
+      - job_name: "redis"
+        static_configs:
+          - targets: ["redis-exporter:9121"]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: thor-firewall
+data:
+  alertmanager.yml: |
+    global:
+      smtp_smarthost: "localhost:587"
+      smtp_from: "thor-alerts@example.com"
+
+    route:
+      group_by: ["alertname", "severity"]
+      group_wait: 10s
+      group_interval: 5m
+      repeat_interval: 1h
+      receiver: "default"
+      routes:
+        - match:
+            severity: critical
+          receiver: "critical"
+          group_wait: 0s
+
+    receivers:
+      - name: "default"
+        webhook_configs:
+          - url: "http://control-plane:8000/api/v1/alerts/webhook"
+
+      - name: "critical"
+        webhook_configs:
+          - url: "http://control-plane:8000/api/v1/alerts/webhook"
+            send_resolved: true
