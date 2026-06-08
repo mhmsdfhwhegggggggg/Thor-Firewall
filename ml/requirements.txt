@@ -65,7 +65,7 @@ pyod>=1.1.3           # 40+ anomaly detection algorithms
 alibi-detect>=0.12.0  # streaming anomaly detection + drift detection
 
 # ── Hyperparameter Optimization ───────────────────────────────────────────────
-optuna>=3.6.0
+optuna>=4.9.0
 optuna-integration[mlflow]>=3.6.0
 
 # ── Explainability ────────────────────────────────────────────────────────────
