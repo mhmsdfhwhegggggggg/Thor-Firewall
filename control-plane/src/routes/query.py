@@ -1,125 +1,382 @@
 """
-Thor Firewall — AI Security Query Route
+Thor Firewall — AI Security Query Route  (Production-Complete)
 تحليل الأسئلة الأمنية بواسطة LLM + RAG
+
+التغييرات عن النسخة السابقة:
+  ✅ لا DEMO_ANSWERS — كل الإجابات من LLM أو بيانات حقيقية
+  ✅ RAG حقيقي: يسحب بيانات من Redis (flows, threats, stats) قبل السؤال
+  ✅ Ollama REST API أولاً (Mistral-7B)، fallback Groq Cloud، fallback local context
+  ✅ Context builder: يُنشئ سياقاً من حالة الشبكة الفعلية
+  ✅ Streaming support (SSE)
 """
-import time
-import os
+
+from __future__ import annotations
+
+import asyncio
+import json
 import logging
-from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
-from typing import Optional
+import os
+import time
+from typing import AsyncGenerator, Optional
+
 import httpx
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
 router = APIRouter()
 logger = logging.getLogger("thor.query")
 
-LLM_SERVER_URL = os.environ.get("THOR_LLM_SERVER_URL", "http://localhost:8081")
+LLM_SERVER_URL = os.environ.get("LLM_SERVER_URL", "http://localhost:11434")  # Ollama
+LLM_MODEL      = os.environ.get("LLM_MODEL", "mistral:7b-instruct-q4_K_M")
+GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
+
+_ollama_ok: Optional[bool] = None
+
 
 class SecurityQuery(BaseModel):
-    question: str = Field(..., min_length=3, max_length=1000)
-    context:  Optional[str] = None
-    max_tokens: int = Field(512, ge=64, le=2048)
+    question: str = Field(..., min_length=3, max_length=2000)
+    context: Optional[str] = None
+    max_tokens: int = Field(512, ge=64, le=4096)
+    stream: bool = False
+
 
 class SecurityQueryResponse(BaseModel):
-    answer:     str
-    model:      str
+    answer: str
+    model: str
     latency_ms: float
     context_used: Optional[str] = None
+    data_sources: list[str] = []
 
-# Pre-baked demo answers for offline mode
-DEMO_ANSWERS = {
-    "top": """Based on the last hour of traffic:
 
-**Top Threat Actors:**
-1. `185.220.101.23` (TOR exit) — SYN flood, 184K pkts/s → BLOCKED
-2. `103.45.67.89`   (AS12345, CN) — SSH brute force, 2847 attempts → BLOCKED
-3. `198.51.100.44`  (AS-UNKNOWN) — Port scan, 1200 ports/10s → RATE LIMITED
-4. `10.0.1.88`      (Internal!)  — C2 beacon to 203.0.113.5:4444 → BLOCKED
-5. `203.0.113.99`   (AS67890, RU) — DNS amplification reflector → BLOCKED
+# ============================================================================
+# Context Builder — RAG from Real Data
+# ============================================================================
 
-**Recommendation:** Add 103.45.67.89/24 to blacklist (entire /24 is TOR infrastructure).""",
+async def _build_network_context(request: Request) -> dict:
+    """
+    يبني سياقاً حقيقياً من الشبكة:
+    - أحدث التهديدات من Redis
+    - إحصاءات اللحظة
+    - أكثر IPs خطورة
+    """
+    context_parts = {}
+    sources = []
 
-    "entropy": """Flows with payload entropy > 7.5 (potential encryption/tunneling):
+    try:
+        redis = request.app.state.redis
 
-| Source IP       | Dest IP     | Port  | Protocol | Entropy | Decision  |
-|-----------------|-------------|-------|----------|---------|-----------|
-| 192.168.1.45   | 8.8.8.8     | 53/UDP | DNS      | 7.91    | Mirror    |
-| 10.0.2.15      | 203.0.113.5 | 443   | TLS      | 7.98    | Blocked   |
-| 172.16.0.88    | 1.1.1.1     | 53/UDP | DNS      | 7.83    | Analyzing |
+        # إحصاءات الشبكة الحالية
+        stats_raw = await redis.hgetall("thor:stats:current")
+        if stats_raw:
+            context_parts["network_stats"] = stats_raw
+            sources.append("redis:stats")
 
-Note: TLS traffic normally has entropy ~7.8-7.9. The DNS flows are anomalous — investigate.""",
+        # آخر 10 تهديدات
+        recent_threats = await redis.lrange("thor:threats:recent", 0, 9)
+        if recent_threats:
+            threats_parsed = []
+            for t in recent_threats:
+                try:
+                    threats_parsed.append(json.loads(t))
+                except Exception:
+                    pass
+            context_parts["recent_threats"] = threats_parsed
+            sources.append("redis:threats")
 
-    "syn": """SYN flood mitigation status:
+        # أكثر IPs خطورة (من sorted set)
+        top_ips = await redis.zrevrangebyscore(
+            "thor:ip_risk_scores", "+inf", "0.5",
+            start=0, num=10, withscores=True,
+        )
+        if top_ips:
+            context_parts["top_malicious_ips"] = [
+                {"ip": ip, "risk_score": float(score)}
+                for ip, score in top_ips
+            ]
+            sources.append("redis:ip_scores")
 
-- **Active defense:** SYN cookies enabled (kernel `tcp_syncookies=1`)  
-- **Current rate:** 184,293 SYN/s from 185.220.101.23 → BLOCKED via XDP DROP
-- **BPF mitigation:** xdp_syn_flood program active, threshold: 1,000 SYN/s per /32
-- **Effectiveness:** 99.7% of flood packets dropped at XDP layer (line rate)
-- **Legitimate traffic:** Zero impact (SYN cookies handle legitimate connections)
+        # بيانات BPF counters
+        bpf_stats = await redis.hgetall("thor:bpf:counters")
+        if bpf_stats:
+            context_parts["bpf_counters"] = bpf_stats
+            sources.append("redis:bpf")
 
-The eBPF SYN guard uses token bucket with 1000 tokens/second per source IP.""",
-}
+        # عدد القواعد النشطة
+        rule_count = await redis.scard("thor:rules:active")
+        context_parts["active_rules"] = rule_count
+        sources.append("redis:rules")
+
+    except Exception as e:
+        logger.debug("Redis context fetch error: %s", e)
+
+    return {"data": context_parts, "sources": sources}
+
+
+def _format_context_for_llm(ctx: dict) -> str:
+    """تحويل البيانات الخام إلى نص منسَّق للـ LLM prompt"""
+    parts = ["## Current Thor Firewall Network Status\n"]
+    data = ctx.get("data", {})
+
+    if stats := data.get("network_stats"):
+        pps = stats.get("packets_per_second", "N/A")
+        flows = stats.get("active_flows", "N/A")
+        blocked = stats.get("blocked_total", "N/A")
+        parts.append(f"**Traffic:** {pps} pps | {flows} active flows | {blocked} blocked total\n")
+
+    if bpf := data.get("bpf_counters"):
+        xdp_pass = bpf.get("xdp_pass", 0)
+        xdp_drop = bpf.get("xdp_drop", 0)
+        parts.append(f"**eBPF:** {xdp_pass} passed | {xdp_drop} dropped at XDP layer\n")
+
+    if threats := data.get("recent_threats"):
+        parts.append("**Recent Threats (last 10):**\n")
+        for t in threats[:5]:
+            src = t.get("src_ip", "?")
+            typ = t.get("threat_type", "unknown")
+            score = t.get("risk_score", 0)
+            parts.append(f"  - {src} → {typ} (risk={score:.2f})\n")
+
+    if ips := data.get("top_malicious_ips"):
+        parts.append("**Top Malicious IPs:**\n")
+        for item in ips[:5]:
+            parts.append(f"  - {item['ip']} (score={item['risk_score']:.2f})\n")
+
+    if not parts[1:]:
+        parts.append("*No live data available — Redis may be empty*\n")
+
+    return "".join(parts)
+
+
+# ============================================================================
+# LLM Backends
+# ============================================================================
+
+async def _check_ollama() -> bool:
+    global _ollama_ok
+    if _ollama_ok is not None:
+        return _ollama_ok
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as c:
+            r = await c.get(f"{LLM_SERVER_URL}/api/tags")
+            _ollama_ok = r.status_code == 200
+    except Exception:
+        _ollama_ok = False
+    return _ollama_ok
+
+
+async def _query_ollama(prompt: str, max_tokens: int) -> Optional[str]:
+    """Ollama REST API — يعمل محلياً مع Mistral-7B"""
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as c:
+            resp = await c.post(
+                f"{LLM_SERVER_URL}/api/generate",
+                json={
+                    "model": LLM_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "num_predict": max_tokens,
+                        "temperature": 0.4,
+                        "top_p": 0.9,
+                        "stop": ["</s>", "[INST]", "User:", "Human:"],
+                    },
+                },
+            )
+            if resp.status_code == 200:
+                return resp.json().get("response", "").strip()
+    except Exception as e:
+        logger.debug("Ollama query failed: %s", e)
+    return None
+
+
+async def _stream_ollama(prompt: str, max_tokens: int) -> AsyncGenerator[str, None]:
+    """Ollama streaming"""
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as c:
+            async with c.stream(
+                "POST",
+                f"{LLM_SERVER_URL}/api/generate",
+                json={
+                    "model": LLM_MODEL,
+                    "prompt": prompt,
+                    "stream": True,
+                    "options": {"num_predict": max_tokens, "temperature": 0.4},
+                },
+            ) as resp:
+                async for line in resp.aiter_lines():
+                    if line:
+                        try:
+                            chunk = json.loads(line)
+                            token = chunk.get("response", "")
+                            if token:
+                                yield f"data: {json.dumps({'token': token})}\n\n"
+                            if chunk.get("done"):
+                                yield "data: [DONE]\n\n"
+                                break
+                        except json.JSONDecodeError:
+                            pass
+    except Exception as e:
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+
+async def _query_groq(prompt: str, max_tokens: int) -> Optional[str]:
+    """Groq Cloud API — fallback عند غياب Ollama"""
+    if not GROQ_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as c:
+            resp = await c.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                json={
+                    "model": "mixtral-8x7b-32768",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are Thor Firewall's AI security analyst. "
+                                "Answer concisely in Markdown. Use real data provided."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "max_tokens": max_tokens,
+                    "temperature": 0.4,
+                },
+            )
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logger.debug("Groq query failed: %s", e)
+    return None
+
+
+def _context_aware_fallback(question: str, network_ctx: dict) -> str:
+    """
+    Fallback إذا لم يتوفر أي LLM — يبني إجابة من البيانات الحقيقية.
+    أفضل بكثير من DEMO_ANSWERS الثابتة.
+    """
+    data = network_ctx.get("data", {})
+    q = question.lower()
+    lines = []
+
+    # محاولة الإجابة بناءً على السؤال + البيانات الحقيقية
+    if any(w in q for w in ("threat", "attack", "malicious", "تهديد", "هجوم")):
+        threats = data.get("recent_threats", [])
+        ips = data.get("top_malicious_ips", [])
+        if threats:
+            lines.append("**Recent Threats Detected:**\n")
+            for t in threats[:5]:
+                lines.append(
+                    f"- `{t.get('src_ip', '?')}` — {t.get('threat_type', 'unknown')} "
+                    f"(risk={float(t.get('risk_score', 0)):.2%})\n"
+                )
+        if ips:
+            lines.append("\n**Top Risk IPs:**\n")
+            for item in ips[:5]:
+                lines.append(f"- `{item['ip']}` score={item['risk_score']:.2%}\n")
+        if not threats and not ips:
+            lines.append("No active threats in the current Redis data. System appears clean.\n")
+
+    elif any(w in q for w in ("stat", "traffic", "flow", "pps", "إحصاء", "حركة")):
+        stats = data.get("network_stats", {})
+        bpf = data.get("bpf_counters", {})
+        if stats:
+            lines.append("**Current Network Statistics:**\n")
+            for k, v in stats.items():
+                lines.append(f"- {k}: {v}\n")
+        if bpf:
+            lines.append("\n**eBPF Counters:**\n")
+            for k, v in bpf.items():
+                lines.append(f"- {k}: {v}\n")
+        if not stats and not bpf:
+            lines.append("No live statistics available in Redis. Agent may not be running.\n")
+
+    elif any(w in q for w in ("block", "حظر", "rule", "قاعدة")):
+        active_rules = data.get("active_rules", 0)
+        lines.append(f"**Active Firewall Rules:** {active_rules}\n\n")
+        lines.append(
+            "To add a block rule: `POST /api/v1/rules` with `{\"action\": \"block\", \"src_ip\": \"...\", \"reason\": \"...\"}`\n"
+        )
+
+    if not lines:
+        sources = network_ctx.get("sources", [])
+        lines.append(
+            f"*LLM server is offline. Live data sources: {', '.join(sources) or 'none'}.*\n\n"
+            f"**Query:** {question}\n\n"
+            "To enable full AI analysis, start Ollama: `ollama serve` and pull Mistral:\n"
+            "`ollama pull mistral:7b-instruct-q4_K_M`\n"
+        )
+
+    return "".join(lines)
+
+
+# ============================================================================
+# Main Route
+# ============================================================================
 
 @router.post("/query", response_model=SecurityQueryResponse, summary="AI security query")
 async def security_query(body: SecurityQuery, request: Request):
     """
-    Ask a natural language question about network security state.
-    Powered by Mistral-7B with RAG over MISP, OTX, CVE feeds.
+    سؤال أمني بلغة طبيعية — يُجيب باستخدام بيانات الشبكة الحقيقية + LLM.
+
+    مسار الإجابة:
+      1. جلب بيانات حقيقية من Redis (RAG)
+      2. بناء prompt مُخصَّص
+      3. Ollama Mistral-7B (محلي) ← الأولوية
+      4. Groq Cloud (fallback إذا كان هناك GROQ_API_KEY)
+      5. Context-aware answer من البيانات الحقيقية (fallback نهائي)
     """
     start = time.perf_counter()
 
-    # Check if LLM server is available
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"{LLM_SERVER_URL}/query",
-                json={
-                    "question": body.question,
-                    "context":  body.context,
-                    "max_tokens": body.max_tokens,
-                },
+    # جلب البيانات الحقيقية
+    network_ctx = await _build_network_context(request)
+    context_str = _format_context_for_llm(network_ctx)
+
+    # بناء الـ prompt
+    system_prompt = (
+        "You are Thor Firewall's AI security analyst. "
+        "Answer the user's security question using the provided real-time network data. "
+        "Be concise, technical, and actionable. Use Markdown formatting."
+    )
+
+    user_context = body.context or context_str
+    full_prompt = (
+        f"[INST] {system_prompt}\n\n"
+        f"### Real-time Network Context\n{user_context}\n\n"
+        f"### Question\n{body.question} [/INST]"
+    )
+
+    # Handle streaming
+    if body.stream:
+        if await _check_ollama():
+            return StreamingResponse(
+                _stream_ollama(full_prompt, body.max_tokens),
+                media_type="text/event-stream",
             )
-            if resp.status_code == 200:
-                data      = resp.json()
-                latency   = (time.perf_counter() - start) * 1000
-                return SecurityQueryResponse(
-                    answer        = data.get("answer", ""),
-                    model         = data.get("model", "mistral-7b"),
-                    latency_ms    = round(latency, 2),
-                    context_used  = data.get("context_used"),
-                )
-    except Exception as e:
-        logger.warning(f"LLM server unavailable ({e}), using demo mode")
 
-    # Demo mode — keyword matching
-    q = body.question.lower()
-    latency = (time.perf_counter() - start) * 1000
+    # Non-streaming
+    answer: Optional[str] = None
+    model_used = "unknown"
 
-    if "top" in q and ("threat" in q or "actor" in q):
-        answer = DEMO_ANSWERS["top"]
-    elif "entropy" in q or "tunnel" in q:
-        answer = DEMO_ANSWERS["entropy"]
-    elif "syn" in q or "flood" in q or "mitigation" in q:
-        answer = DEMO_ANSWERS["syn"]
-    elif "block" in q or "blocklist" in q:
-        answer = (
-            "IPs recommended for blocklist based on current threat intelligence:\n\n"
-            "- `185.220.101.23/32` — Active TOR exit, SYN flood source\n"
-            "- `103.45.67.89/24`   — SSH brute force botnet (entire /24)\n"
-            "- `10.0.1.88/32`      — Internal machine with C2 beacon (investigate!)\n\n"
-            "Use `POST /api/v1/rules` with action=block to add these."
-        )
-    else:
-        answer = (
-            f"Query: *{body.question}*\n\n"
-            "**Note:** LLM server is not currently running. "
-            "Start `ml/llm/explainer.py` for full AI-powered analysis.\n\n"
-            "Current network status: 142,847 active flows, 3 active threats, "
-            "99.7% blocked at eBPF layer. System operating normally."
-        )
+    if await _check_ollama():
+        answer = await _query_ollama(full_prompt, body.max_tokens)
+        model_used = LLM_MODEL
 
+    if not answer and GROQ_API_KEY:
+        answer = await _query_groq(full_prompt, body.max_tokens)
+        model_used = "groq/mixtral-8x7b"
+
+    if not answer:
+        answer = _context_aware_fallback(body.question, network_ctx)
+        model_used = "context-engine-v1"
+
+    latency_ms = (time.perf_counter() - start) * 1000
     return SecurityQueryResponse(
-        answer     = answer,
-        model      = "demo-mode",
-        latency_ms = round(latency, 2),
+        answer=answer,
+        model=model_used,
+        latency_ms=round(latency_ms, 2),
+        context_used=context_str[:500] if context_str else None,
+        data_sources=network_ctx.get("sources", []),
     )

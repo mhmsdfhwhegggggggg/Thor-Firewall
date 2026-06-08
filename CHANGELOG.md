@@ -226,3 +226,70 @@ Format: [version] — date — summary
 - Improved simulation heuristics: 5 patterns (SYN-only, port scan, high-entropy C2, exfiltration, bot-speed)
 - EMA latency tracking: 99% old + 1% new per batch
 - Stats: added http_errors + http_fallbacks counters
+
+---
+
+## [0.5.0] — 2026-06-07 — Phase 5: Production Completeness (Fixes Report Issues)
+
+> تحويل الـ stubs والبيانات الوهمية إلى تنفيذ حقيقي كامل
+
+### Fixed
+
+#### `ml/serving/inference_server.py` (592 lines) — was: `explanation=None`
+- `generate_explanation()`: شرح حقيقي بـ 3 مستويات:
+  1. Ollama REST API (Mistral-7B محلي) للتدفقات ذات risk > 0.6
+  2. محرك قواعد محلي (5 أنماط: SYN flood, port scan, high-entropy C2, exfiltration, bot-speed)
+  3. Fallback دائم — لا تعيد `None` أبداً
+- `/v1/analyze/batch` endpoint مُضاف (alias لـ `/infer/batch`) — يتوافق مع `rl_core.rs`
+- `analyze_batch_sync()` لـ PyO3 InProcess mode — يعيد explanations حقيقية
+- GNN embedding يُدمج فعلياً في القرار (concat [50 + 32])
+- Prometheus metrics: INFER_LATENCY histogram, INFER_COUNTER, ACCURACY_GAUGE
+- Hot-reload: `/model/reload` يمسح explanation cache
+
+#### `control-plane/src/routes/query.py` (382 lines) — was: hardcoded DEMO_ANSWERS
+- لا DEMO_ANSWERS — كل الإجابات من بيانات حقيقية أو LLM
+- `_build_network_context()`: RAG حقيقي من Redis (stats, threats, top IPs, BPF counters)
+- `_query_ollama()`: Ollama REST API (Mistral-7B) — أولوية أولى
+- `_query_groq()`: Groq Cloud fallback (إذا GROQ_API_KEY متاح)
+- `_context_aware_fallback()`: يبني إجابة من بيانات Redis الحقيقية (لا hardcoded)
+- Streaming support: `/query` مع `stream: true` → SSE من Ollama
+
+#### `control-plane/src/routes/websocket.py` (389 lines) — was: `import random` throughout
+- ❌ حذف `import random` وكل `random.randint/random.uniform` 
+- `_read_live_stats()`: يقرأ من Redis pipeline واحدة (6 keys في طلب واحد)
+  - `thor:stats:current`, `thor:bpf:counters`, `thor:ml:stats`, `thor:agent:health`
+- `_threat_push_loop()`: Redis Pub/Sub على `thor:pubsub:events` — أحداث فورية
+- Back-pressure: يرسل diff فقط (لا يُعيد إرسال بيانات ثابتة)
+- Heartbeat كل 30 ثانية (كان 60)
+- الأحداث التاريخية: يُرسل آخر 5 تهديدات عند الاتصال
+
+#### `kernel-modules/windows/wfp/callout_driver.c` (1038 lines) — was: EMPTY FILE
+- `DriverEntry()`: إنشاء Device Object + Symbolic Link + dispatch routines
+- `ThorInitWfp()`: تسجيل 4 callouts: ALE_AUTH_RECV_ACCEPT_V4/V6 + ALE_FLOW_ESTABLISHED_V4/V6
+- `ThorClassifyV4/V6()`: Classify functions حقيقية مع blacklist/whitelist lookup
+- `ThorNotify()`: Notify function لإشعارات Filter
+- `ThorFlowDelete()`: cleanup flow context
+- Ring Buffer (8 MB, 32K entries): shared memory مع user-mode بـ zero-copy
+  - THOR_RING_HEADER + THOR_RING_ENTRY: timestamp_ns, IPs, ports, protocol, verdict, flow_id
+  - `IOCTL_THOR_MAP_RING`: تعيين Ring Buffer في user space
+- IOCTL interface: GET_STATS, BLOCK_IP, UNBLOCK_IP, WHITELIST_IP, SET_MODE, MAP_RING
+- `IP_HASH_ENTRY`: blacklist/whitelist entries مع RTL_HASHTABLE
+- `ThorDriverUnload()`: cleanup كامل (WFP unregister + ring buffer free + device delete)
+
+#### `agent/src/stats_publisher.rs` (NEW — 210 lines)
+- `run_stats_publisher()`: background task يقرأ BPF counters كل 1s ويكتبها لـ Redis
+- يكتب: `thor:stats:current`, `thor:bpf:counters`, `thor:ml:stats`, `thor:agent:health`
+- TTL تلقائي 10 ثوانٍ لكل key
+- `publish_threat_event()`: يكتب للـ list التاريخي + sorted set + Pub/Sub channel
+- `publish_flow_blocked()`: يكتب أحداث الحظر للـ WebSocket clients
+- `read_cpu_usage()` و`read_memory_usage_mb()` من `/proc/self/stat`
+
+### Summary
+
+| الملف | الحالة السابقة | الحالة الجديدة |
+|-------|--------------|--------------|
+| inference_server.py | `explanation=None` دائماً | Ollama LLM + rule-based explanation |
+| query.py | DEMO_ANSWERS hardcoded | RAG حقيقي + Ollama + Groq |
+| websocket.py | `random.randint()` | Redis BPF counters حقيقية |
+| callout_driver.c | ملف **فارغ** | WFP driver كامل (1038 سطر) |
+| stats_publisher.rs | غير موجود | Redis publisher لكل الـ stats |
