@@ -1,72 +1,38 @@
 [package]
 name = "thor-agent"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-license.workspace = true
-description = "Thor Firewall Agent — High-performance packet processing and RL decision engine"
+version = "1.0.0"
+edition = "2021"
+authors = ["Thor Security Team"]
+description = "Thor Firewall eBPF/XDP Network Agent"
+license = "MIT"
 
 [[bin]]
 name = "thor-agent"
 path = "src/main.rs"
 
-[lib]
-name = "thor_agent"
-path = "src/lib.rs"
-
 [dependencies]
-# Workspace deps
-tokio = { workspace = true }
-tokio-util = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-tracing-opentelemetry = { workspace = true }
-opentelemetry = { workspace = true }
-opentelemetry-otlp = { workspace = true }
-prometheus = { workspace = true }
-anyhow = { workspace = true }
-thiserror = { workspace = true }
-config = { workspace = true }
-clap = { workspace = true }
-crossbeam = { workspace = true }
-dashmap = { workspace = true }
-parking_lot = { workspace = true }
-rayon = { workspace = true }
-blake3 = { workspace = true }
-xxhash-rust = { workspace = true }
-redis = { workspace = true }
-prost = { workspace = true }
-tonic = { workspace = true }
-pyo3 = { workspace = true }
-bincode = { workspace = true }
-libc = { workspace = true }
-etherparse = { workspace = true }
-
-# Linux-specific
-[target.'cfg(target_os = "linux")'.dependencies]
-aya = { workspace = true }
-aya-log = { workspace = true }
-nix = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pyo3 = { version = "0.21", features = ["auto-initialize"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "1"
+metrics = "0.22"
+metrics-exporter-prometheus = "0.13"
+uuid = { version = "1", features = ["v4"] }
+tokio-util = "0.7"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
-mockall = "0.13"
 tokio-test = "0.4"
-tempfile = "3.12"
+mockall = "0.12"
 
-[[bench]]
-name = "packet_parsing"
-harness = false
-
-[[bench]]
-name = "flow_manager"
-harness = false
-
-[features]
-default = ["metrics", "tracing"]
-metrics = []
-tracing = []
-hardware-timestamps = []
-dpdk = []
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

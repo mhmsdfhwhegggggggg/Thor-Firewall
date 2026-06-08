@@ -1,0 +1,74 @@
+{
+  "title": "Thor ML Performance Dashboard",
+  "uid": "thor-ml-perf",
+  "tags": ["thor", "ml", "security"],
+  "schemaVersion": 38,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "ML Detection Accuracy",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "thor_ml_accuracy * 100", "legendFormat": "Accuracy %" }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": { "steps": [
+            { "color": "red", "value": 0 },
+            { "color": "yellow", "value": 90 },
+            { "color": "green", "value": 95 }
+          ]}
+        }
+      }
+    },
+    {
+      "id": 2, "type": "stat", "title": "Inference P99 Latency",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "histogram_quantile(0.99, rate(thor_ml_inference_duration_seconds_bucket[5m])) * 1000", "legendFormat": "P99 ms" }],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "id": 3, "type": "stat", "title": "Throughput (inferences/s)",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "rate(thor_ml_inferences_total[1m])", "legendFormat": "inferences/s" }],
+      "fieldConfig": { "defaults": { "unit": "reqps" } }
+    },
+    {
+      "id": 4, "type": "stat", "title": "Concept Drift Score",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "thor_ml_concept_drift_score", "legendFormat": "Drift" }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "steps": [
+            { "color": "green", "value": 0 },
+            { "color": "yellow", "value": 0.2 },
+            { "color": "red", "value": 0.3 }
+          ]}
+        }
+      }
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "False Positive Rate over Time",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "thor_ml_false_positive_rate", "legendFormat": "FP Rate" },
+        { "expr": "0.001", "legendFormat": "Target (0.1%)" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit" } }
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Attack Type Distribution",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "rate(thor_threats_total{threat_type!=\"\"}[5m])", "legendFormat": "{{threat_type}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" } }
+    },
+    {
+      "id": 7, "type": "table", "title": "Model Registry",
+      "gridPos": { "x": 0, "y": 12, "w": 24, "h": 6 },
+      "targets": [{ "expr": "thor_ml_model_info", "legendFormat": "{{model_name}} v{{version}}" }]
+    }
+  ]
+}

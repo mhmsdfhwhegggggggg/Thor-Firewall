@@ -1,0 +1,79 @@
+# Thor Firewall — ML Model Accuracy Alerts
+groups:
+  - name: thor_ml_alerts
+    interval: 60s
+    rules:
+      - alert: MLModelAccuracyDrop
+        expr: thor_ml_accuracy < 0.95
+        for: 5m
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "ML model accuracy dropped below 95%"
+          description: "Current accuracy: {{ $value | humanizePercentage }}."
+      - alert: MLModelAccuracyCritical
+        expr: thor_ml_accuracy < 0.90
+        for: 2m
+        labels:
+          severity: critical
+          team: ml
+        annotations:
+          summary: "ML model accuracy critically low (< 90%)"
+          description: "URGENT: Accuracy {{ $value | humanizePercentage }}. Trigger emergency retraining."
+      - alert: MLInferenceLatencyHigh
+        expr: histogram_quantile(0.99, rate(thor_ml_inference_duration_seconds_bucket[5m])) > 0.005
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ML inference P99 latency > 5ms"
+      - alert: MLConceptDrift
+        expr: thor_ml_concept_drift_score > 0.3
+        for: 10m
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "Concept drift detected (score {{ $value }})"
+
+  - name: thor_security_alerts
+    interval: 30s
+    rules:
+      - alert: HighThreatRate
+        expr: rate(thor_threats_total[5m]) > 100
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High threat detection rate: {{ $value | humanize }}/s"
+      - alert: CriticalThreatRate
+        expr: rate(thor_threats_total{severity="critical"}[1m]) > 10
+        for: 30s
+        labels:
+          severity: critical
+          page: "true"
+        annotations:
+          summary: "CRITICAL threats at {{ $value | humanize }}/s — possible attack"
+      - alert: AgentDown
+        expr: up{job="thor-agent"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          page: "true"
+        annotations:
+          summary: "Thor agent DOWN on {{ $labels.instance }} — protection offline"
+      - alert: UEBAHighRiskEntities
+        expr: count(thor_ueba_entity_risk_score > 0.8) > 5
+        for: 5m
+        labels:
+          severity: high
+        annotations:
+          summary: "{{ $value }} high-risk entities detected (risk > 80%)"
+      - alert: SOARPlaybookFailureRate
+        expr: rate(thor_soar_failures_total[5m]) / rate(thor_soar_executions_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SOAR failure rate {{ $value | humanizePercentage }}"

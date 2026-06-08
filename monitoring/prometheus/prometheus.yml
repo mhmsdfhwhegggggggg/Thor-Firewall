@@ -1,0 +1,52 @@
+# Thor Firewall — Prometheus Configuration
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'thor-production'
+    environment: 'production'
+
+rule_files:
+  - "alerts/*.yaml"
+  - "rules/*.yaml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+scrape_configs:
+  - job_name: 'thor-agent'
+    static_configs:
+      - targets: ['thor-agent:9100']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+
+  - job_name: 'thor-control-plane'
+    metrics_path: '/api/metrics'
+    static_configs:
+      - targets: ['control-plane:8000']
+
+  - job_name: 'thor-ml-inference'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['ml-inference:8082']
+
+  - job_name: 'clickhouse'
+    static_configs:
+      - targets: ['clickhouse:9363']
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names: ['thor-production', 'thor-staging']
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
