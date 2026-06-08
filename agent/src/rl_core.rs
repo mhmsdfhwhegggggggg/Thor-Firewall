@@ -1,340 +1,213 @@
-// Thor Firewall — Reinforcement Learning Core
-// نواة التعلم المعزز — مُحدَّثة بـ HTTP client حقيقي
-//
-// يستدعي ml-inference FastAPI server عبر HTTP بدلاً من stubs
-// SPDX-License-Identifier: MIT
+//! Thor Firewall — RL Decision Core
+//! محرك قرارات التعلم المعزز — Rust
+//!
+//! يرسل batch requests إلى ML inference server (Python FastAPI)
+//! ويستقبل القرارات (BLOCK/ALLOW + risk score + threat type)
+//!
+//! SPDX-License-Identifier: MIT
 
-use std::sync::Arc;
-use std::time::Duration;
-
-use anyhow::{bail, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, info, warn};
+use std::time::{Duration, Instant};
+use tracing::{debug, error, warn};
 
-use crate::flow_manager::Decision;
-use crate::packet_parser::{FlowKey, ParsedPacket};
+// ── Action Types ─────────────────────────────────────────────────────────────
 
-/// طلب تحليل من محرك RL
-#[derive(Debug, Clone, Serialize)]
-pub struct RLRequest {
-    pub flow_key_hash: u64,
-    pub features: Vec<f32>,
-    pub protocol: String,
-    pub gnn_embedding: Option<Vec<f32>>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum FlowAction {
+    Allow   = 0,
+    Block   = 1,
+    Monitor = 2,
+    Throttle= 3,
+    Redirect= 4,
 }
 
-/// استجابة محرك RL
-#[derive(Debug, Clone, Deserialize)]
-pub struct RLResponse {
-    pub flow_key_hash: u64,
-    pub decision: String,
-    pub risk_score: f32,
-    pub confidence: f32,
-    pub explanation: Option<String>,
-    pub agent_id: String,
-    pub inference_time_us: Option<u64>,
-}
-
-/// استجابة batch
-#[derive(Debug, Clone, Deserialize)]
-struct BatchAnalysisResponse {
-    pub responses: Vec<RLResponse>,
-    pub total_time_us: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct BatchAnalysisRequest {
-    pub requests: Vec<RLRequest>,
-}
-
-impl RLResponse {
-    pub fn to_decision(&self) -> Decision {
-        match self.decision.as_str() {
-            "block"    => Decision::Block,
-            "throttle" => Decision::Throttle { rate_pps: 100 },
-            "mirror"   => Decision::Mirror,
-            "redirect" => Decision::Redirect { port: 9999 },
-            _          => Decision::Allow,
+impl std::fmt::Display for FlowAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Allow    => write!(f, "ALLOW"),
+            Self::Block    => write!(f, "BLOCK"),
+            Self::Monitor  => write!(f, "MONITOR"),
+            Self::Throttle => write!(f, "THROTTLE"),
+            Self::Redirect => write!(f, "REDIRECT"),
         }
     }
 }
 
-/// وضع تشغيل محرك RL
-#[derive(Debug, Clone)]
-pub enum RLMode {
-    /// استدعاء عبر HTTP REST API (الوضع الافتراضي)
-    RestApi { url: String },
-    /// وضع المحاكاة — للاختبار فقط
-    Simulation,
+// ── ML Server Request/Response ────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct BatchRequest {
+    flows:    Vec<Vec<f32>>,
+    flow_ids: Vec<String>,
 }
 
-/// إعدادات محرك RL
-#[derive(Debug, Clone)]
-pub struct RLConfig {
-    pub mode: RLMode,
-    pub batch_size: usize,
-    pub batch_timeout_us: u64,
-    pub max_pending: usize,
-    pub auto_block_threshold: f32,
-    pub suspicious_threshold: f32,
-    pub http_timeout_ms: u64,
+#[derive(Debug, Deserialize)]
+struct FlowDecision {
+    flow_id:     Option<String>,
+    action:      u8,
+    action_name: String,
+    confidence:  f32,
+    risk_score:  f32,
+    blocked:     bool,
+    threat_type: Option<String>,
 }
 
-impl Default for RLConfig {
-    fn default() -> Self {
-        Self {
-            mode: RLMode::RestApi {
-                url: std::env::var("ML_INFERENCE_URL")
-                    .unwrap_or_else(|_| "http://ml-inference:8082".to_string()),
-            },
-            batch_size: 64,
-            batch_timeout_us: 1000,
-            max_pending: 10_000,
-            auto_block_threshold: 0.85,
-            suspicious_threshold: 0.5,
-            http_timeout_ms: 50,
-        }
-    }
+#[derive(Debug, Deserialize)]
+struct BatchResponse {
+    decisions:          Vec<FlowDecision>,
+    batch_size:         usize,
+    inference_time_ms:  f64,
+    model_version:      String,
 }
 
-/// إحصاءات الأداء
-#[derive(Debug, Default, Serialize)]
-pub struct RLStats {
-    pub total_analyzed: u64,
-    pub total_blocked: u64,
-    pub total_allowed: u64,
-    pub avg_latency_us: f64,
-    pub http_errors: u64,
-    pub simulation_mode: bool,
+// ── RL Core ──────────────────────────────────────────────────────────────────
+
+pub struct ThorRLCore {
+    ml_url:    String,
+    http:      reqwest::Client,
+    /// نقطة نهاية batch inference
+    endpoint:  String,
 }
 
-/// نواة محرك التعلم المعزز
-#[derive(Clone)]
-pub struct RLCore {
-    config: RLConfig,
-    request_tx: mpsc::Sender<(RLRequest, mpsc::Sender<RLResponse>)>,
-    stats: Arc<RwLock<RLStats>>,
-    http_client: Option<reqwest::Client>,
-}
+impl ThorRLCore {
+    pub async fn new(ml_url: &str) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .pool_max_idle_per_host(32)
+            .tcp_nodelay(true)
+            .build()
+            .context("Failed to build HTTP client")?;
 
-impl RLCore {
-    pub async fn new(config: RLConfig) -> Result<Self> {
-        let (tx, rx) = mpsc::channel(config.max_pending);
-        let stats = Arc::new(RwLock::new(RLStats {
-            simulation_mode: matches!(config.mode, RLMode::Simulation),
-            ..Default::default()
-        }));
-
-        // بناء HTTP client واحد مشترك (connection pooling)
-        let http_client = if let RLMode::RestApi { .. } = &config.mode {
-            Some(
-                reqwest::Client::builder()
-                    .timeout(Duration::from_millis(config.http_timeout_ms))
-                    .tcp_keepalive(Duration::from_secs(60))
-                    .pool_max_idle_per_host(10)
-                    .build()
-                    .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?
-            )
-        } else {
-            None
-        };
+        let endpoint = format!("{}/v1/analyze/batch", ml_url.trim_end_matches('/'));
 
         let core = Self {
-            config: config.clone(),
-            request_tx: tx,
-            stats: stats.clone(),
-            http_client: http_client.clone(),
+            ml_url: ml_url.to_string(),
+            http,
+            endpoint,
         };
 
-        // بدء معالج الدفعات
-        let config_clone = config.clone();
-        let stats_clone = stats.clone();
-        tokio::spawn(async move {
-            batch_worker(rx, config_clone, http_client, stats_clone).await;
-        });
-
-        match &config.mode {
-            RLMode::RestApi { url } => info!("RLCore initialized → REST API at {}", url),
-            RLMode::Simulation => warn!("RLCore initialized in SIMULATION mode — not for production!"),
+        // Connection check (non-fatal)
+        if let Err(e) = core.health_check().await {
+            warn!("ML inference not reachable at startup: {} — will retry on demand", e);
         }
 
         Ok(core)
     }
 
-    /// إرسال حزمة للتحليل (غير متزامن)
-    pub async fn analyze(&self, packet: &ParsedPacket) -> Result<RLResponse> {
-        let features: Vec<f32> = packet.to_feature_vector().to_vec();
-        let protocol = match packet.flow_key.protocol {
-            crate::packet_parser::Protocol::Tcp  => "tcp",
-            crate::packet_parser::Protocol::Udp  => "udp",
-            crate::packet_parser::Protocol::Icmp => "icmp",
-            _                                     => "other",
-        }.to_string();
+    /// فحص صحة الاتصال بـ ML inference server
+    pub async fn health_check(&self) -> Result<()> {
+        let url = format!("{}/health", self.ml_url.trim_end_matches('/'));
+        let resp = self.http.get(&url).send().await
+            .context("ML health check request failed")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("ML health check returned {}", resp.status());
+        }
+        Ok(())
+    }
 
-        let request = RLRequest {
-            flow_key_hash: packet.flow_key.hash(),
-            features,
-            protocol,
-            gnn_embedding: None,
+    /// تحليل batch من flows وإعادة قرارات الحظر/السماح
+    pub async fn analyze_batch(
+        &self,
+        features: &[Vec<f32>],
+        flow_ids: &[String],
+    ) -> Result<Vec<(FlowAction, f32, Option<String>)>> {
+        if features.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let t0 = Instant::now();
+
+        let body = BatchRequest {
+            flows: features.to_vec(),
+            flow_ids: flow_ids.to_vec(),
         };
 
-        let (resp_tx, mut resp_rx) = mpsc::channel(1);
-        self.request_tx.send((request, resp_tx)).await
-            .map_err(|_| anyhow::anyhow!("RL worker channel closed"))?;
+        let resp = self.http
+            .post(&self.endpoint)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {} failed", self.endpoint))?;
 
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            resp_rx.recv()
-        ).await
-            .map_err(|_| anyhow::anyhow!("RL analysis timed out"))?
-            .ok_or_else(|| anyhow::anyhow!("RL worker dropped response"))
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("ML inference returned {}: {}", status, &body[..body.len().min(200)]);
+        }
+
+        let batch: BatchResponse = resp.json().await
+            .context("Failed to deserialize ML response")?;
+
+        let elapsed = t0.elapsed();
+        debug!(
+            "ML batch: {} flows | inference={:.3}ms | total={:.3}ms",
+            batch.batch_size,
+            batch.inference_time_ms,
+            elapsed.as_secs_f64() * 1000.0,
+        );
+
+        // Record Prometheus histogram
+        metrics::histogram!(
+            "thor_rl_decision_latency_ms",
+            elapsed.as_secs_f64() * 1000.0
+        );
+
+        let results: Vec<(FlowAction, f32, Option<String>)> = batch
+            .decisions
+            .into_iter()
+            .map(|d| {
+                let action = if d.blocked || d.risk_score > 0.85 {
+                    FlowAction::Block
+                } else if d.risk_score > 0.5 {
+                    FlowAction::Monitor
+                } else {
+                    FlowAction::Allow
+                };
+                (action, d.risk_score, d.threat_type)
+            })
+            .collect();
+
+        Ok(results)
     }
 
-    pub async fn stats(&self) -> RLStats {
-        let s = self.stats.read().await;
-        RLStats {
-            total_analyzed: s.total_analyzed,
-            total_blocked: s.total_blocked,
-            total_allowed: s.total_allowed,
-            avg_latency_us: s.avg_latency_us,
-            http_errors: s.http_errors,
-            simulation_mode: s.simulation_mode,
-        }
-    }
-}
+    /// تحليل flow واحد (wrapper فوق analyze_batch)
+    pub async fn analyze_single(
+        &self,
+        features: Vec<f32>,
+        flow_id: &str,
+    ) -> Result<(FlowAction, f32, Option<String>)> {
+        let results = self.analyze_batch(
+            &[features],
+            &[flow_id.to_string()],
+        ).await?;
 
-/// معالج الدفعات — يجمع الطلبات ويرسلها دفعة واحدة
-async fn batch_worker(
-    mut rx: mpsc::Receiver<(RLRequest, mpsc::Sender<RLResponse>)>,
-    config: RLConfig,
-    http_client: Option<reqwest::Client>,
-    stats: Arc<RwLock<RLStats>>,
-) {
-    let batch_timeout = Duration::from_micros(config.batch_timeout_us);
-
-    loop {
-        let mut batch: Vec<(RLRequest, mpsc::Sender<RLResponse>)> = Vec::with_capacity(config.batch_size);
-
-        match rx.recv().await {
-            Some(item) => batch.push(item),
-            None => {
-                info!("RL batch worker shutting down");
-                break;
-            }
-        }
-
-        let deadline = tokio::time::Instant::now() + batch_timeout;
-        while batch.len() < config.batch_size {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(item)) => batch.push(item),
-                _ => break,
-            }
-        }
-
-        let start = std::time::Instant::now();
-        let requests: Vec<RLRequest> = batch.iter().map(|(r, _)| r.clone()).collect();
-        let responses = run_inference(&config, &http_client, &requests).await;
-        let latency_us = start.elapsed().as_micros() as f64;
-
-        // إرسال الردود
-        for ((_, tx), response) in batch.into_iter().zip(responses.into_iter()) {
-            let _ = tx.send(response).await;
-        }
-
-        // تحديث الإحصاءات
-        let mut s = stats.write().await;
-        s.total_analyzed += requests.len() as u64;
-        s.avg_latency_us = (s.avg_latency_us * 0.99) + (latency_us * 0.01);
+        results.into_iter().next()
+            .ok_or_else(|| anyhow::anyhow!("Empty batch response"))
     }
 }
 
-/// تشغيل inference بحسب الوضع
-async fn run_inference(
-    config: &RLConfig,
-    http_client: &Option<reqwest::Client>,
-    requests: &[RLRequest],
-) -> Vec<RLResponse> {
-    match &config.mode {
-        RLMode::RestApi { url } => {
-            call_ml_inference_api(url, http_client.as_ref().unwrap(), requests).await
-        }
-        RLMode::Simulation => {
-            simulate_responses(requests)
-        }
-    }
-}
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
-/// استدعاء ML Inference Server الحقيقي عبر HTTP
-async fn call_ml_inference_api(
-    base_url: &str,
-    client: &reqwest::Client,
-    requests: &[RLRequest],
-) -> Vec<RLResponse> {
-    let url = format!("{}/v1/analyze/batch", base_url.trim_end_matches('/'));
-    let payload = serde_json::json!({ "requests": requests });
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    match client.post(&url).json(&payload).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            match resp.json::<BatchAnalysisResponse>().await {
-                Ok(batch_resp) => {
-                    debug!(
-                        count = batch_resp.responses.len(),
-                        total_us = batch_resp.total_time_us,
-                        "ML batch inference complete"
-                    );
-                    return batch_resp.responses;
-                }
-                Err(e) => {
-                    error!("Failed to parse ML response: {} — falling back to simulation", e);
-                }
-            }
-        }
-        Ok(resp) => {
-            warn!("ML inference API returned HTTP {} — falling back to simulation", resp.status());
-        }
-        Err(e) => {
-            warn!("ML inference API unreachable: {} — falling back to simulation", e);
-        }
+    #[test]
+    fn test_flow_action_display() {
+        assert_eq!(FlowAction::Block.to_string(), "BLOCK");
+        assert_eq!(FlowAction::Allow.to_string(), "ALLOW");
     }
 
-    // Fallback to simulation on error
-    simulate_responses(requests)
-}
-
-/// محاكاة بسيطة للاستخدام في الاختبار أو عند انقطاع الخادم
-fn simulate_responses(requests: &[RLRequest]) -> Vec<RLResponse> {
-    requests.iter().map(|req| {
-        let features = &req.features;
-        let risk = simulate_risk(features);
-        let decision = if risk > 0.85 { "block" }
-                      else if risk > 0.5 { "mirror" }
-                      else { "allow" };
-
-        RLResponse {
-            flow_key_hash: req.flow_key_hash,
-            decision: decision.to_string(),
-            risk_score: risk,
-            confidence: 0.65,
-            explanation: if decision != "allow" {
-                Some(format!("[SIM] Risk score: {:.2}", risk))
-            } else { None },
-            agent_id: format!("sim-{}-agent", req.protocol),
-            inference_time_us: Some(10),
-        }
-    }).collect()
-}
-
-fn simulate_risk(features: &[f32]) -> f32 {
-    let mut risk = 0.05f32;
-    if features.len() > 21 && features[20] > 0.0 && features[21] == 0.0 {
-        risk += 0.4; // SYN without ACK
+    #[tokio::test]
+    async fn test_empty_batch() {
+        let core = ThorRLCore {
+            ml_url: "http://localhost:8082".to_string(),
+            http: reqwest::Client::new(),
+            endpoint: "http://localhost:8082/v1/analyze/batch".to_string(),
+        };
+        let result = core.analyze_batch(&[], &[]).await.unwrap();
+        assert!(result.is_empty());
     }
-    if features.len() > 30 && features[30] > 7.5 {
-        risk += 0.3; // High entropy payload
-    }
-    if features.len() > 2 && features[2] > 100_000.0 {
-        risk += 0.3; // Very high packet count
-    }
-    risk.min(0.99)
 }
