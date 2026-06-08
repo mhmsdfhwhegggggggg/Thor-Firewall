@@ -2,11 +2,7 @@
 Thor Firewall Helm Helpers
 */}}
 
-{{- define "thor-firewall.name" -}}
-{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
-{{- end }}
-
-{{- define "thor-firewall.fullname" -}}
+{{- define "thor.fullname" -}}
 {{- if .Values.fullnameOverride }}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
@@ -19,21 +15,19 @@ Thor Firewall Helm Helpers
 {{- end }}
 {{- end }}
 
-{{- define "thor-firewall.chart" -}}
-{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{- define "thor.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
-{{- define "thor-firewall.labels" -}}
-helm.sh/chart: {{ include "thor-firewall.chart" . }}
-{{ include "thor-firewall.selectorLabels" . }}
-{{- if .Chart.AppVersion }}
-app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
-{{- end }}
+{{- define "thor.labels" -}}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
+{{ include "thor.selectorLabels" . }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
-app.kubernetes.io/part-of: thor-firewall
+app.kubernetes.io/version: {{ .Values.global.tag | quote }}
+thor.security/platform: "true"
 {{- end }}
 
-{{- define "thor-firewall.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "thor-firewall.name" . }}
+{{- define "thor.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "thor.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}

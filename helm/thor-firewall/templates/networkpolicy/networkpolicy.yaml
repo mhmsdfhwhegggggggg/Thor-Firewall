@@ -1,0 +1,173 @@
+# Thor Firewall — Kubernetes NetworkPolicy
+# يُقيّد الاتصالات بين الـ pods بمبدأ Zero Trust (deny-all then allow specific)
+
+---
+# Default deny all ingress and egress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "thor.fullname" . }}-default-deny
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "thor.labels" . | nindent 4 }}
+spec:
+  podSelector: {}   # تطبّق على جميع الـ pods
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+# Allow: control-plane → ClickHouse
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "thor.fullname" . }}-allow-clickhouse
+  namespace: {{ .Release.Namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: control-plane
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: clickhouse
+      ports:
+        - protocol: TCP
+          port: 9000    # ClickHouse native
+        - protocol: TCP
+          port: 8123    # ClickHouse HTTP
+
+---
+# Allow: control-plane → Redis
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "thor.fullname" . }}-allow-redis
+  namespace: {{ .Release.Namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: control-plane
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+
+---
+# Allow: agent → control-plane (over mTLS port)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "thor.fullname" . }}-allow-agent-to-api
+  namespace: {{ .Release.Namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: control-plane
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: agent
+      ports:
+        - protocol: TCP
+          port: {{ .Values.controlPlane.port | default 8000 }}
+
+---
+# Allow: control-plane → ml-inference
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "thor.fullname" . }}-allow-ml
+  namespace: {{ .Release.Namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: control-plane
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: ml-inference
+      ports:
+        - protocol: TCP
+          port: 8080
+
+---
+# Allow: ingress controller → dashboard + control-plane
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "thor.fullname" . }}-allow-ingress
+  namespace: {{ .Release.Namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "thor.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8000
+        - protocol: TCP
+          port: 3000
+
+---
+# Allow: Prometheus → all pods (scraping)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "thor.fullname" . }}-allow-prometheus
+  namespace: {{ .Release.Namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "thor.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9090    # metrics endpoint
+
+---
+# Allow: DNS resolution (UDP 53)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "thor.fullname" . }}-allow-dns
+  namespace: {{ .Release.Namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "thor.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

@@ -1,0 +1,163 @@
+# Thor Firewall — Control Plane Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "thor.fullname" . }}-control-plane
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "thor.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+spec:
+  replicas: {{ .Values.controlPlane.replicaCount | default 2 }}
+  selector:
+    matchLabels:
+      {{- include "thor.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: control-plane
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0      # Zero downtime
+  template:
+    metadata:
+      labels:
+        {{- include "thor.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: control-plane
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: {{ include "thor.fullname" . }}-control-plane
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: control-plane
+          image: "{{ .Values.global.registry }}/thor-control-plane:{{ .Values.global.tag }}"
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: {{ .Values.controlPlane.port | default 8000 }}
+            - name: metrics
+              containerPort: 9090
+          envFrom:
+            - secretRef:
+                name: {{ include "thor.fullname" . }}-secrets
+          env:
+            {{- range $k, $v := .Values.controlPlane.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.controlPlane.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: reports
+              mountPath: /app/reports
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: reports
+          emptyDir: {}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: control-plane
+                topologyKey: kubernetes.io/hostname
+
+---
+# Agent DaemonSet
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "thor.fullname" . }}-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "thor.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+spec:
+  selector:
+    matchLabels:
+      {{- include "thor.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "thor.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: {{ include "thor.fullname" . }}-agent
+      hostNetwork: true      # مطلوب للـ packet capture
+      hostPID: false
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        {{- toYaml .Values.agent.tolerations | nindent 8 }}
+      containers:
+        - name: agent
+          image: "{{ .Values.global.registry }}/thor-agent:{{ .Values.global.tag }}"
+          imagePullPolicy: Always
+          args:
+            - --iface={{ .Values.agent.iface | default "eth0" }}
+            - --enable-ebpf={{ .Values.agent.enableEbpf | default "false" }}
+          envFrom:
+            - secretRef:
+                name: {{ include "thor.fullname" . }}-secrets
+          env:
+            - name: CONTROL_PLANE_URL
+              value: "http://{{ include "thor.fullname" . }}-control-plane:{{ .Values.controlPlane.port | default 8000 }}"
+            - name: ML_INFERENCE_URL
+              value: "http://{{ include "thor.fullname" . }}-ml-inference:8080"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            {{- toYaml .Values.agent.resources | nindent 12 }}
+          securityContext:
+            privileged: false
+            capabilities:
+              add: {{- toYaml .Values.agent.securityContext.capabilities.add | nindent 16 }}
+              drop: ["ALL"]
+          ports:
+            - name: metrics
+              containerPort: 9090
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/proc/net/dev"]
+            initialDelaySeconds: 5
+            periodSeconds: 10

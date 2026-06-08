@@ -1,27 +1,32 @@
 apiVersion: v2
 name: thor-firewall
-description: Thor Enterprise Security Platform — NGFW + XDR + SIEM + UEBA
+description: Thor Firewall — Enterprise Security Platform (eBPF + ML + K8s)
 type: application
 version: 1.0.0
 appVersion: "1.0.0"
 keywords:
   - security
   - firewall
-  - ngfw
-  - xdr
-  - siem
   - ebpf
   - ml
-home: https://github.com/mhmsdfhwhegggggggg/Thor-Firewall
+  - siem
 maintainers:
-  - name: Thor Build Team
-    email: security@thorfire.io
+  - name: Thor Security Team
+    url: https://github.com/mhmsdfhwhegggggggg/Thor-Firewall
 dependencies:
-  - name: redis
-    version: "18.x.x"
-    repository: https://charts.bitnami.com/bitnami
-    condition: redis.enabled
   - name: clickhouse
-    version: "6.x.x"
+    version: "~6.x"
     repository: https://charts.bitnami.com/bitnami
     condition: clickhouse.enabled
+  - name: redis
+    version: "~20.x"
+    repository: https://charts.bitnami.com/bitnami
+    condition: redis.enabled
+  - name: prometheus
+    version: "~25.x"
+    repository: https://prometheus-community.github.io/helm-charts
+    condition: monitoring.prometheus.enabled
+  - name: grafana
+    version: "~8.x"
+    repository: https://grafana.github.io/helm-charts
+    condition: monitoring.grafana.enabled

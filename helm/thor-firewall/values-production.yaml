@@ -1,0 +1,123 @@
+# Thor Firewall — Production Helm Values
+# غيّر القيم المُعلَّمة قبل النشر
+
+global:
+  tag: "latest"            # ← غيّر لـ version tag (مثال: v1.0.0)
+  registry: "ghcr.io/mhmsdfhwhegggggggg"
+
+# ── Ingress ────────────────────────────────────────────────────────────────────
+ingress:
+  enabled: true
+  certIssuer: letsencrypt-prod
+  hosts:
+    - host: thor.yourdomain.com      # ← غيّر هذا
+      paths:
+        - path: /
+          pathType: Prefix
+          service: thor-dashboard
+          port: 3000
+        - path: /api
+          pathType: Prefix
+          service: thor-control-plane
+          port: 8000
+        - path: /ws
+          pathType: Prefix
+          service: thor-control-plane
+          port: 8000
+  rateLimit:
+    rps: 100
+    connections: 50
+
+# ── Control Plane ─────────────────────────────────────────────────────────────
+controlPlane:
+  replicaCount: 3          # HA
+  port: 8000
+  resources:
+    requests: { cpu: "500m", memory: "512Mi" }
+    limits:   { cpu: "2000m", memory: "2Gi" }
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 20
+    targetCPUUtilizationPercentage: 70
+  env:
+    ENVIRONMENT: production
+    WORKERS: "4"
+    CORS_ORIGINS: "https://thor.yourdomain.com"
+    JWT_ALGORITHM: "HS256"
+    LOG_LEVEL: "info"
+
+# ── Agent (DaemonSet — يعمل على كل node) ────────────────────────────────────
+agent:
+  enabled: true
+  iface: eth0              # ← الـ interface الرئيسية
+  enableEbpf: true         # يتطلب kernel >= 5.8
+  resources:
+    requests: { cpu: "100m", memory: "128Mi" }
+    limits:   { cpu: "500m", memory: "512Mi" }
+  tolerations:             # للـ master nodes
+    - key: node-role.kubernetes.io/control-plane
+      effect: NoSchedule
+  securityContext:
+    privileged: false      # eBPF يحتاج capabilities لا privileged
+    capabilities:
+      add:
+        - BPF
+        - NET_ADMIN
+        - SYS_RESOURCE
+      drop:
+        - ALL
+
+# ── ML Inference ──────────────────────────────────────────────────────────────
+mlInference:
+  replicaCount: 2
+  resources:
+    requests: { cpu: "1000m", memory: "2Gi" }
+    limits:   { cpu: "4000m", memory: "8Gi" }
+  nodeSelector:
+    accelerator: nvidia-tesla-t4    # استخدم GPU للإنتاج
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+clickhouse:
+  enabled: true
+  persistence:
+    size: 500Gi
+    storageClass: gp3
+  replicaCount: 3          # ClickHouse cluster
+  shards: 2
+
+redis:
+  enabled: true
+  architecture: replication
+  auth:
+    enabled: true
+  master:
+    persistence: { size: 10Gi }
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+secrets:
+  useHelmSecrets: false    # ← اضبط true فقط للاختبار
+  useExternalSecrets: true # ← استخدم External Secrets في الإنتاج
+  # databaseUrl / clickhouseUrl / redisUrl / jwtSecret
+  # تُجلَب من AWS Secrets Manager تلقائياً
+
+# ── Monitoring ────────────────────────────────────────────────────────────────
+monitoring:
+  prometheus:
+    enabled: true
+    retention: 30d
+    storage: 100Gi
+  grafana:
+    enabled: true
+    adminPassword: ""      # ← اضبط من secret
+    persistence: { size: 10Gi }
+
+# ── PodDisruptionBudget ───────────────────────────────────────────────────────
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2          # ضمان توافر على الأقل 2 pods أثناء الـ maintenance
+
+# ── ServiceAccount ────────────────────────────────────────────────────────────
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT:role/thor-control-plane-role"

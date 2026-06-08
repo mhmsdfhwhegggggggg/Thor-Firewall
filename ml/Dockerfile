@@ -1,27 +1,25 @@
-# Thor Firewall — ML Service Dockerfile
-FROM python:3.12-slim as base
+# Thor Firewall — ML Inference Server Dockerfile
+FROM nvidia/cuda:12.4-runtime-ubuntu22.04 AS gpu-runtime
 
-WORKDIR /app
-
-# System deps
-RUN apt-get update && apt-get install -y \
-    curl build-essential git \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 python3.12-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Python deps
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+WORKDIR /app
+COPY ml/requirements-serve.txt ./requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt
 
-# App code
-COPY . .
+COPY ml/serving/ ./serving/
+COPY ml/ueba/    ./ueba/
+COPY ml/online/  ./online/
 
-# Non-root user
-RUN useradd -u 1000 -m thor && chown -R thor:thor /app
+# Model directory (mount as PV in K8s)
+RUN mkdir -p /models && chmod 777 /models
+
+RUN useradd -r -s /sbin/nologin thor && chown -R thor:thor /app
 USER thor
 
-EXPOSE 8082
+EXPOSE 8080
+HEALTHCHECK --interval=30s CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"
 
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-    CMD curl -f http://localhost:8082/health || exit 1
-
-CMD ["python", "serving/inference_server.py"]
+CMD ["python3", "-m", "uvicorn", "serving.inference_server:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "2"]

@@ -1,0 +1,91 @@
+# Thor Firewall — Kubernetes RBAC
+# ServiceAccounts + Roles + RoleBindings للـ components
+
+---
+# ServiceAccount: control-plane
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "thor.fullname" . }}-control-plane
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "thor.labels" . | nindent 4 }}
+  annotations:
+    {{- if .Values.serviceAccount.annotations }}
+    {{- toYaml .Values.serviceAccount.annotations | nindent 4 }}
+    {{- end }}
+automountServiceAccountToken: false
+
+---
+# ServiceAccount: agent (يحتاج cluster-level access)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "thor.fullname" . }}-agent
+  namespace: {{ .Release.Namespace }}
+automountServiceAccountToken: true   # مطلوب للـ eBPF
+
+---
+# ClusterRole: agent needs to read nodes/pods for topology
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "thor.fullname" . }}-agent
+  labels:
+    {{- include "thor.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]   # لتطبيق SOAR blocks
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]   # للـ isolation playbook
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "thor.fullname" . }}-agent
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "thor.fullname" . }}-agent
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "thor.fullname" . }}-agent
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Role: control-plane — read secrets in own namespace only
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "thor.fullname" . }}-control-plane
+  namespace: {{ .Release.Namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ include "thor.fullname" . }}-secrets
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "thor.fullname" . }}-control-plane
+  namespace: {{ .Release.Namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "thor.fullname" . }}-control-plane
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "thor.fullname" . }}-control-plane
+  apiGroup: rbac.authorization.k8s.io

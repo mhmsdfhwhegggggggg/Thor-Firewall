@@ -1,0 +1,63 @@
+# Control Plane Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "thor.fullname" . }}-control-plane
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "thor.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "thor.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+  ports:
+    - name: http
+      port: {{ .Values.controlPlane.port | default 8000 }}
+      targetPort: http
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+
+---
+# ML Inference Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "thor.fullname" . }}-ml-inference
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "thor.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ml-inference
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "thor.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: ml-inference
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: metrics
+      port: 9090
+
+---
+# Dashboard Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "thor.fullname" . }}-dashboard
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "thor.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dashboard
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "thor.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: dashboard
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000

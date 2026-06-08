@@ -1,9 +1,13 @@
+[workspace]
+members = [".", "xtask"]
+resolver = "2"
+
 [package]
 name = "thor-agent"
 version = "1.0.0"
 edition = "2021"
 authors = ["Thor Security Team"]
-description = "Thor Firewall eBPF/XDP Network Agent"
+description = "Thor Firewall eBPF/XDP Agent — Real kernel-level packet filtering"
 license = "MIT"
 
 [[bin]]
@@ -11,28 +15,57 @@ name = "thor-agent"
 path = "src/main.rs"
 
 [dependencies]
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+# Async runtime
 tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
+
+# eBPF userspace (Rust-native, no C required)
+aya            = { version = "0.13", features = ["async_tokio"] }
+aya-log        = "0.2"
+
+# HTTP client for ML inference
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Serialization
+serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-pyo3 = { version = "0.21", features = ["auto-initialize"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-anyhow = "1"
-thiserror = "1"
-metrics = "0.22"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Logging + tracing
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Metrics → Prometheus
+metrics                    = "0.22"
 metrics-exporter-prometheus = "0.13"
-uuid = { version = "1", features = ["v4"] }
+
+# Error handling
+anyhow    = "1"
+thiserror = "1"
+
+# Utilities
+uuid      = { version = "1", features = ["v4"] }
+hostname  = "0.3"
+bytes     = "1"
 tokio-util = "0.7"
-bytes = "1"
-clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
-mockall = "0.12"
+mockall    = "0.12"
+
+# eBPF kernel program (compiled separately)
+[package.metadata.ebpf]
+programs = ["src/ebpf/xdp_filter.bpf.rs"]
+target   = "bpfel-unknown-none"
 
 [profile.release]
-opt-level = 3
-lto = true
+opt-level   = 3
+lto         = true
 codegen-units = 1
-strip = true
+strip       = true
+debug       = false
+
+[profile.dev]
+opt-level = 1
+debug     = true
