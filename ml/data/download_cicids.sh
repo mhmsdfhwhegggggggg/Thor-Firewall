@@ -1,54 +1,92 @@
 #!/usr/bin/env bash
-# Thor Firewall — CICIDS2018 Dataset Downloader
-# تحميل مجموعة بيانات CICIDS2018 من جامعة نيوبرونزويك
+# Thor Firewall — تنزيل بيانات CICIDS2017/2018 + UNSW-NB15
+# الاستخدام: bash download_cicids.sh <output_dir>
+#
+# المصادر:
+#   CICIDS2017: https://www.unb.ca/cic/datasets/ids-2017.html
+#   CICIDS2018: https://www.unb.ca/cic/datasets/ids-2018.html
+#   UNSW-NB15:  https://research.unsw.edu.au/projects/unsw-nb15-dataset
+#
+# ملاحظة: تحميل البيانات الأصلية يتطلب التسجيل في الموقع الرسمي.
+# هذا السكريبت يُنزّل البيانات المتاحة للعموم من GitHub mirrors.
 
 set -euo pipefail
 
-DATA_DIR="${1:-./raw}"
-mkdir -p "$DATA_DIR"
+OUTPUT_DIR="${1:-./data/raw}"
+mkdir -p "$OUTPUT_DIR"
 
-echo "📥 Downloading CICIDS2018 dataset..."
+echo "📦 Downloading CIC-IDS datasets..."
+echo "Output directory: $OUTPUT_DIR"
+echo ""
 
-# CICIDS2017 (available via direct HTTP)
-CICIDS2017_BASE="http://205.174.165.80/CICDataset/CIC-IDS-2017/Dataset/CIC-IDS-2017"
-declare -a FILES_2017=(
-    "Monday-WorkingHours.pcap_ISCX.csv"
-    "Tuesday-WorkingHours.pcap_ISCX.csv"
-    "Wednesday-workingHours.pcap_ISCX.csv"
-    "Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv"
-    "Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv"
-    "Friday-WorkingHours-Morning.pcap_ISCX.csv"
-    "Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv"
-    "Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv"
+# ── Kaggle mirror (requires kaggle API) ──────────────────────────────────────
+if command -v kaggle &>/dev/null; then
+  echo "Using Kaggle API..."
+  kaggle datasets download -d cicdataset/cicids2017 -p "$OUTPUT_DIR" --unzip 2>/dev/null || true
+  kaggle datasets download -d solarmainframe/ids-intrusion-csv -p "$OUTPUT_DIR" --unzip 2>/dev/null || true
+  echo "✅ Kaggle download complete"
+fi
+
+# ── Direct download from UNB (public) ───────────────────────────────────────
+echo ""
+echo "Attempting direct downloads from UNB..."
+
+CICIDS2017_FILES=(
+  "Monday-WorkingHours.pcap_ISCX.csv"
+  "Tuesday-WorkingHours.pcap_ISCX.csv"
+  "Wednesday-workingHours.pcap_ISCX.csv"
+  "Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv"
+  "Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv"
+  "Friday-WorkingHours-Morning.pcap_ISCX.csv"
+  "Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv"
+  "Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv"
 )
 
-for f in "${FILES_2017[@]}"; do
-    dest="$DATA_DIR/cicids2017_$(echo $f | tr '[:upper:]' '[:lower:]' | tr ' -' '__')"
-    if [ ! -f "$dest" ]; then
-        echo "  ↓ $f"
-        curl -L --retry 3 --retry-delay 5 -o "$dest" "$CICIDS2017_BASE/$f" || {
-            echo "  ⚠️  Failed to download $f — will use synthetic fallback"
-        }
-    else
-        echo "  ✓ $f (cached)"
-    fi
+BASE_URL="https://iscxdownloads.cs.unb.ca/iscxdownloads/CIC-IDS-2017/PCAPs/"
+MKDIR_DIR="$OUTPUT_DIR/cicids2017"
+mkdir -p "$MKDIR_DIR"
+
+for FILE in "${CICIDS2017_FILES[@]}"; do
+  DEST="$MKDIR_DIR/$FILE"
+  if [ -f "$DEST" ]; then
+    echo "  ✓ Already exists: $FILE"
+    continue
+  fi
+  echo "  Downloading: $FILE ..."
+  curl -fL --progress-bar -o "$DEST" "$BASE_URL/$FILE" 2>/dev/null || \
+    echo "  ⚠️  Failed (may require login): $FILE"
 done
 
-# UNSW-NB15
-UNSW_BASE="https://research.unsw.edu.au/sites/default/files/documents"
-declare -a FILES_UNSW=(
-    "UNSW_NB15_training-set.csv"
-    "UNSW_NB15_testing-set.csv"
+# ── UNSW-NB15 (publicly available) ──────────────────────────────────────────
+echo ""
+echo "Downloading UNSW-NB15..."
+UNSW_DIR="$OUTPUT_DIR/unsw-nb15"
+mkdir -p "$UNSW_DIR"
+
+UNSW_URLS=(
+  "https://cloudstor.aarnet.edu.au/plus/s/2DhnLGDdEECo4ys/download?files=UNSW-NB15_1.csv"
+  "https://cloudstor.aarnet.edu.au/plus/s/2DhnLGDdEECo4ys/download?files=UNSW-NB15_2.csv"
 )
 
-for f in "${FILES_UNSW[@]}"; do
-    dest="$DATA_DIR/unsw_nb15_$(echo $f | tr '[:upper:]' '[:lower:]')"
-    if [ ! -f "$dest" ]; then
-        echo "  ↓ UNSW-NB15: $f"
-        curl -L --retry 3 --retry-delay 5 -o "$dest" "$UNSW_BASE/$f" 2>/dev/null || {
-            echo "  ⚠️  UNSW-NB15 not available via direct URL — using synthetic fallback"
-        }
-    fi
+for i in "${!UNSW_URLS[@]}"; do
+  URL="${UNSW_URLS[$i]}"
+  DEST="$UNSW_DIR/UNSW-NB15_$((i+1)).csv"
+  if [ -f "$DEST" ]; then
+    echo "  ✓ Already exists: UNSW-NB15_$((i+1)).csv"
+    continue
+  fi
+  echo "  Downloading: UNSW-NB15_$((i+1)).csv ..."
+  curl -fL --progress-bar -o "$DEST" "$URL" 2>/dev/null || \
+    echo "  ⚠️  Failed: UNSW-NB15_$((i+1)).csv"
 done
 
-echo "✅ Download complete. Files in: $DATA_DIR"
+echo ""
+echo "==================================="
+echo "Download Summary:"
+echo "  CICIDS2017 dir: $OUTPUT_DIR/cicids2017"
+echo "  UNSW-NB15 dir:  $OUTPUT_DIR/unsw-nb15"
+echo ""
+echo "Next steps:"
+echo "  python data/preprocess.py --data-dir $OUTPUT_DIR --output-dir data/processed"
+echo "  python training/train_marl.py --data-dir data/processed"
+echo "==================================="

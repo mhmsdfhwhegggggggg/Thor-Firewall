@@ -1,86 +1,29 @@
 """
-Thor Firewall — UEBA Behavioral Baseline Engine
-محرك تحليل سلوك المستخدمين والكيانات
+Thor Firewall — UEBA Behavioral Baseline
+خط الأساس السلوكي لكشف الشذوذ
 
-يبني نمطاً سلوكياً طبيعياً لكل entity ثم يكشف الانحرافات.
+يستخدم Welford's online algorithm لحساب mean/variance
+بدون تخزين كل الملاحظات (memory efficient).
 
 SPDX-License-Identifier: MIT
 """
 from __future__ import annotations
-import asyncio
-import json
-import logging
-import time
+import json, logging, time
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Tuple
-from collections import defaultdict, deque
+from pathlib import Path
+from typing import Dict, List, Optional
+
 import numpy as np
 
 logger = logging.getLogger("thor.ueba.baseline")
 
-@dataclass
-class EntityBaseline:
-    entity_id: str
-    entity_type: str  # "user" | "device" | "ip"
-    # Temporal patterns
-    active_hours: List[float] = field(default_factory=lambda: [0.0]*24)
-    active_days: List[float] = field(default_factory=lambda: [0.0]*7)
-    # Volume patterns
-    avg_bytes_per_hour: float = 0.0
-    std_bytes_per_hour: float = 0.0
-    avg_connections_per_hour: float = 0.0
-    std_connections_per_hour: float = 0.0
-    # Peer patterns
-    peer_group: Optional[str] = None
-    # Geo patterns
-    known_countries: List[str] = field(default_factory=list)
-    known_asns: List[int] = field(default_factory=list)
-    # Service patterns
-    known_ports: List[int] = field(default_factory=list)
-    known_protocols: List[str] = field(default_factory=list)
-    # Metadata
-    baseline_period_days: int = 30
-    last_updated: float = field(default_factory=time.time)
-    sample_count: int = 0
 
 @dataclass
-class BehaviorEvent:
-    entity_id: str
-    entity_type: str
-    timestamp: float
-    bytes_transferred: int
-    connections: int
-    dst_ports: List[int]
-    protocols: List[str]
-    countries: List[str]
-    hour_of_day: int = field(init=False)
-    day_of_week: int = field(init=False)
-
-    def __post_init__(self):
-        import datetime
-        dt = datetime.datetime.utcfromtimestamp(self.timestamp)
-        self.hour_of_day = dt.hour
-        self.day_of_week = dt.weekday()
-
-@dataclass
-class AnomalyAlert:
-    entity_id: str
-    entity_type: str
-    timestamp: float
-    anomaly_type: str
-    severity: str          # "low" | "medium" | "high" | "critical"
-    risk_delta: float      # sigma deviation
-    description: str
-    evidence: Dict
-    mitre_technique: Optional[str] = None
-
-
-class WelfordOnlineStats:
-    """حساب المتوسط والانحراف المعياري بشكل تدريجي (بدون تخزين كل البيانات)"""
-    def __init__(self):
-        self.n = 0
-        self.mean = 0.0
-        self.M2 = 0.0
+class WelfordStats:
+    """Welford's algorithm لحساب الإحصاءات التدريجي"""
+    n: int = 0
+    mean: float = 0.0
+    M2: float = 0.0    # Variance * (n-1)
 
     def update(self, x: float):
         self.n += 1
@@ -91,186 +34,135 @@ class WelfordOnlineStats:
 
     @property
     def variance(self) -> float:
-        return self.M2 / max(self.n - 1, 1)
+        return self.M2 / self.n if self.n >= 2 else 0.0
 
     @property
     def std(self) -> float:
-        return np.sqrt(self.variance)
+        return self.variance ** 0.5
 
     def zscore(self, x: float) -> float:
         if self.std < 1e-10:
             return 0.0
-        return (x - self.mean) / self.std
+        return abs(x - self.mean) / self.std
 
 
-class UEBABaselineEngine:
-    """
-    محرك بناء وتحديث baselines سلوكية
+@dataclass
+class EntityBaseline:
+    """خط الأساس السلوكي لـ entity واحد"""
+    entity_id: str
+    entity_type: str        # "user" | "host" | "service" | "ip"
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
 
-    يستخدم نافذة منزلقة (sliding window) مدتها 30 يوماً
-    ويدعم تحديث تدريجي بدون إعادة حساب كامل.
-    """
+    # الإحصاءات السلوكية
+    bytes_per_hour: WelfordStats = field(default_factory=WelfordStats)
+    connections_per_hour: WelfordStats = field(default_factory=WelfordStats)
+    unique_destinations: WelfordStats = field(default_factory=WelfordStats)
+    failed_auth_per_hour: WelfordStats = field(default_factory=WelfordStats)
+    dns_queries_per_hour: WelfordStats = field(default_factory=WelfordStats)
 
-    def __init__(
-        self,
-        redis_client=None,
-        baseline_window_days: int = 30,
-        min_samples: int = 100,
-    ):
-        self.redis = redis_client
-        self.baseline_window = baseline_window_days * 86400
-        self.min_samples = min_samples
+    # Active hours pattern (24 bins)
+    hourly_activity: List[int] = field(default_factory=lambda: [0] * 24)
 
-        # In-memory baselines (للسرعة)
+    def update(self, observation: Dict[str, float]):
+        """تحديث خط الأساس بملاحظة جديدة"""
+        self.updated_at = time.time()
+        hour = int(time.localtime().tm_hour)
+        self.hourly_activity[hour] += 1
+
+        if "bytes" in observation:
+            self.bytes_per_hour.update(observation["bytes"])
+        if "connections" in observation:
+            self.connections_per_hour.update(observation["connections"])
+        if "unique_dsts" in observation:
+            self.unique_destinations.update(observation["unique_dsts"])
+        if "failed_auth" in observation:
+            self.failed_auth_per_hour.update(observation["failed_auth"])
+        if "dns_queries" in observation:
+            self.dns_queries_per_hour.update(observation["dns_queries"])
+
+    def anomaly_score(self, observation: Dict[str, float]) -> float:
+        """
+        نقطة الشذوذ (0.0–1.0)
+        مبنية على Z-score لكل بُعد + معامل ترجيح
+        """
+        if self.bytes_per_hour.n < 10:
+            return 0.0  # لا يوجد خط أساس كافٍ
+
+        scores = []
+        weights = []
+
+        if "bytes" in observation and self.bytes_per_hour.n >= 10:
+            z = self.bytes_per_hour.zscore(observation["bytes"])
+            scores.append(min(z / 5.0, 1.0))
+            weights.append(0.3)
+
+        if "connections" in observation and self.connections_per_hour.n >= 10:
+            z = self.connections_per_hour.zscore(observation["connections"])
+            scores.append(min(z / 5.0, 1.0))
+            weights.append(0.25)
+
+        if "unique_dsts" in observation and self.unique_destinations.n >= 10:
+            z = self.unique_destinations.zscore(observation["unique_dsts"])
+            scores.append(min(z / 5.0, 1.0))
+            weights.append(0.2)
+
+        if "failed_auth" in observation and self.failed_auth_per_hour.n >= 10:
+            z = self.failed_auth_per_hour.zscore(observation["failed_auth"])
+            scores.append(min(z / 3.0, 1.0))  # أقل sigma للـ failed auth
+            weights.append(0.25)
+
+        if not scores:
+            return 0.0
+
+        total_w = sum(weights[:len(scores)])
+        return sum(s * w for s, w in zip(scores, weights)) / total_w
+
+    def is_off_hours(self) -> bool:
+        """هل النشاط خارج ساعات العمل الطبيعية؟"""
+        if sum(self.hourly_activity) < 100:
+            return False  # لا يوجد نمط كافٍ
+        normal_hours = sorted(range(24), key=lambda h: self.hourly_activity[h], reverse=True)[:10]
+        current_hour = int(time.localtime().tm_hour)
+        return current_hour not in normal_hours
+
+
+class BehavioralBaselineStore:
+    """مخزن خطوط الأساس لجميع الكيانات"""
+
+    def __init__(self, persist_path: Optional[str] = None):
         self._baselines: Dict[str, EntityBaseline] = {}
-        # Online stats للتحديث التدريجي
-        self._stats: Dict[str, Dict[str, WelfordOnlineStats]] = defaultdict(
-            lambda: defaultdict(WelfordOnlineStats)
-        )
-        # Event buffer (آخر 1000 حدث لكل entity)
-        self._event_buffer: Dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
+        self._persist_path = Path(persist_path) if persist_path else None
 
-    def update_baseline(self, event: BehaviorEvent) -> Optional[AnomalyAlert]:
-        """
-        تحديث الـ baseline بحدث جديد وإعادة alert إذا كان شاذاً.
-        يُستدعى لكل حدث في الزمن الحقيقي.
-        """
-        eid = event.entity_id
-        baseline = self._baselines.setdefault(eid, EntityBaseline(
-            entity_id=eid,
-            entity_type=event.entity_type,
-        ))
+    def get_or_create(self, entity_id: str, entity_type: str = "host") -> EntityBaseline:
+        if entity_id not in self._baselines:
+            self._baselines[entity_id] = EntityBaseline(entity_id=entity_id, entity_type=entity_type)
+        return self._baselines[entity_id]
 
-        # تحديث إحصاءات الحجم
-        self._stats[eid]["bytes"].update(event.bytes_transferred)
-        self._stats[eid]["connections"].update(event.connections)
+    def update(self, entity_id: str, observation: Dict[str, float], entity_type: str = "host"):
+        baseline = self.get_or_create(entity_id, entity_type)
+        baseline.update(observation)
 
-        # تحديث أنماط الوقت
-        baseline.active_hours[event.hour_of_day] += 1
-        baseline.active_days[event.day_of_week] += 1
-
-        # تحديث معرفة المنافذ والبروتوكولات
-        for port in event.dst_ports:
-            if port not in baseline.known_ports:
-                baseline.known_ports.append(port)
-        for proto in event.protocols:
-            if proto not in baseline.known_protocols:
-                baseline.known_protocols.append(proto)
-        for country in event.countries:
-            if country not in baseline.known_countries:
-                baseline.known_countries.append(country)
-
-        baseline.sample_count += 1
-        baseline.last_updated = time.time()
-
-        # لا نفحص الشذوذ حتى نجمع عينات كافية
-        if baseline.sample_count < self.min_samples:
-            self._event_buffer[eid].append(event)
-            return None
-
-        # فحص الشذوذ
-        alert = self._detect_anomaly(event, baseline)
-        self._event_buffer[eid].append(event)
-        return alert
-
-    def _detect_anomaly(self, event: BehaviorEvent, baseline: EntityBaseline) -> Optional[AnomalyAlert]:
-        """كشف الانحرافات عن السلوك الطبيعي"""
-        eid = event.entity_id
-        alerts = []
-
-        # ── 1. حجم البيانات غير طبيعي ──
-        bytes_z = self._stats[eid]["bytes"].zscore(event.bytes_transferred)
-        if abs(bytes_z) > 3.0:
-            severity = "critical" if abs(bytes_z) > 5.0 else "high" if abs(bytes_z) > 4.0 else "medium"
-            alerts.append(AnomalyAlert(
-                entity_id=eid,
-                entity_type=event.entity_type,
-                timestamp=event.timestamp,
-                anomaly_type="volume_spike",
-                severity=severity,
-                risk_delta=bytes_z,
-                description=f"Data transfer volume {event.bytes_transferred/1e6:.1f}MB is {bytes_z:.1f}σ above baseline",
-                evidence={
-                    "current_bytes": event.bytes_transferred,
-                    "baseline_mean": self._stats[eid]["bytes"].mean,
-                    "baseline_std": self._stats[eid]["bytes"].std,
-                    "zscore": bytes_z,
-                },
-                mitre_technique="T1030",  # Data Transfer Size Limits
-            ))
-
-        # ── 2. ساعة غير معتادة ──
-        hour_activity = baseline.active_hours[event.hour_of_day]
-        total_activity = sum(baseline.active_hours)
-        hour_ratio = hour_activity / max(total_activity, 1)
-        if hour_ratio < 0.01 and total_activity > 200:
-            alerts.append(AnomalyAlert(
-                entity_id=eid,
-                entity_type=event.entity_type,
-                timestamp=event.timestamp,
-                anomaly_type="unusual_time",
-                severity="medium",
-                risk_delta=3.0,
-                description=f"Activity at hour {event.hour_of_day:02d}:00 UTC — only {hour_ratio*100:.1f}% of historical activity",
-                evidence={"hour": event.hour_of_day, "historical_ratio": hour_ratio},
-                mitre_technique="T1078",  # Valid Accounts
-            ))
-
-        # ── 3. دولة جديدة ──
-        new_countries = [c for c in event.countries if c and c not in baseline.known_countries]
-        if new_countries:
-            alerts.append(AnomalyAlert(
-                entity_id=eid,
-                entity_type=event.entity_type,
-                timestamp=event.timestamp,
-                anomaly_type="new_geography",
-                severity="high",
-                risk_delta=4.0,
-                description=f"New geographic location: {', '.join(new_countries)}",
-                evidence={"new_countries": new_countries, "known_countries": baseline.known_countries},
-                mitre_technique="T1078.004",  # Cloud Accounts
-            ))
-
-        # ── 4. عدد اتصالات غير طبيعي ──
-        conn_z = self._stats[eid]["connections"].zscore(event.connections)
-        if conn_z > 4.0:
-            alerts.append(AnomalyAlert(
-                entity_id=eid,
-                entity_type=event.entity_type,
-                timestamp=event.timestamp,
-                anomaly_type="connection_spike",
-                severity="high",
-                risk_delta=conn_z,
-                description=f"{event.connections} connections — {conn_z:.1f}σ above baseline",
-                evidence={"connections": event.connections, "zscore": conn_z},
-                mitre_technique="T1046",  # Network Service Discovery
-            ))
-
-        if not alerts:
-            return None
-
-        # إعادة أعلى تنبيه
-        severity_order = {"critical": 4, "high": 3, "medium": 2, "low": 1}
-        return max(alerts, key=lambda a: severity_order.get(a.severity, 0))
-
-    def get_entity_risk_score(self, entity_id: str) -> float:
-        """نقاط الخطر التراكمية للـ entity (0.0 – 1.0)"""
+    def score(self, entity_id: str, observation: Dict[str, float]) -> float:
         baseline = self._baselines.get(entity_id)
-        if not baseline or baseline.sample_count < self.min_samples:
+        if not baseline:
             return 0.0
+        return baseline.anomaly_score(observation)
 
-        events = list(self._event_buffer[entity_id])
-        if not events:
-            return 0.0
-
-        recent_events = [e for e in events if time.time() - e.timestamp < 3600]
-        if not recent_events:
-            return 0.0
-
-        recent_bytes = sum(e.bytes_transferred for e in recent_events)
-        bytes_z = self._stats[entity_id]["bytes"].zscore(recent_bytes)
-        risk = min(abs(bytes_z) / 10.0, 1.0)
-        return round(risk, 3)
-
-    def get_all_baselines(self) -> List[Dict]:
-        return [asdict(b) for b in self._baselines.values()]
+    def get_high_risk_entities(self, threshold: float = 0.7) -> List[Dict]:
+        """قائمة الكيانات ذات المخاطر العالية"""
+        results = []
+        for eid, b in self._baselines.items():
+            if b.bytes_per_hour.n < 10:
+                continue
+            # تقدير النقطة من آخر قراءة تقريبية
+            score = min(b.bytes_per_hour.zscore(b.bytes_per_hour.mean * 3) / 5.0, 1.0)
+            if score > threshold:
+                results.append({
+                    "entity_id": eid,
+                    "entity_type": b.entity_type,
+                    "risk_score": round(score, 3),
+                    "observations": b.bytes_per_hour.n,
+                    "off_hours": b.is_off_hours(),
+                })
+        return sorted(results, key=lambda x: x["risk_score"], reverse=True)
