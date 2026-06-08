@@ -1,0 +1,219 @@
+# Thor Firewall — Default Helm Values
+# Override with: helm install thor ./thor-firewall -f values.production.yaml
+
+global:
+  imageRegistry: ghcr.io/mhmsdfhwhegggggggg
+  imageTag: "1.0.0"
+  pullPolicy: IfNotPresent
+  storageClass: ""
+
+# ── Thor Agent (DaemonSet — runs on every node) ────────────────────────────
+agent:
+  enabled: true
+  image:
+    repository: thor-agent
+    tag: ""  # uses global.imageTag
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+  # Required for eBPF/XDP
+  hostNetwork: true
+  hostPID: true
+  privileged: true
+  capabilities:
+    - NET_ADMIN
+    - NET_RAW
+    - SYS_ADMIN
+    - IPC_LOCK
+  env:
+    RUST_LOG: "thor_agent=info,warn"
+  nodeSelector: {}
+  tolerations:
+    - operator: Exists
+  # eBPF volume mounts
+  extraVolumes:
+    - name: bpf-fs
+      hostPath:
+        path: /sys/fs/bpf
+    - name: debugfs
+      hostPath:
+        path: /sys/kernel/debug
+
+# ── Control Plane (Deployment) ─────────────────────────────────────────────
+controlPlane:
+  enabled: true
+  image:
+    repository: thor-control-plane
+    tag: ""
+  replicas: 2
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 20
+    targetCPUUtilizationPercentage: 70
+  service:
+    type: ClusterIP
+    port: 8000
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+    hosts:
+      - host: api.thor.example.com
+        paths:
+          - path: /api
+            pathType: Prefix
+    tls:
+      - secretName: thor-api-tls
+        hosts:
+          - api.thor.example.com
+
+# ── ML Inference Server (Deployment) ──────────────────────────────────────
+mlInference:
+  enabled: true
+  image:
+    repository: thor-ml-inference
+    tag: ""
+  replicas: 1
+  resources:
+    requests:
+      cpu: "1"
+      memory: "2Gi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 80
+  gpu:
+    enabled: false
+    count: 1
+  modelStorage:
+    enabled: true
+    size: 20Gi
+    storageClass: ""
+
+# ── MLflow Tracking Server ─────────────────────────────────────────────────
+mlflow:
+  enabled: true
+  image:
+    repository: ghcr.io/mlflow/mlflow
+    tag: "2.11.0"
+  replicas: 1
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "1"
+      memory: "2Gi"
+  persistence:
+    enabled: true
+    size: 50Gi
+  service:
+    port: 5000
+
+# ── Dashboard (Deployment) ─────────────────────────────────────────────────
+dashboard:
+  enabled: true
+  image:
+    repository: thor-dashboard
+    tag: ""
+  replicas: 2
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+  ingress:
+    enabled: true
+    className: nginx
+    hosts:
+      - host: thor.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: thor-dashboard-tls
+        hosts:
+          - thor.example.com
+
+# ── ClickHouse (StatefulSet) ───────────────────────────────────────────────
+clickhouse:
+  enabled: true
+  replicaCount: 1
+  shards: 1
+  persistence:
+    enabled: true
+    size: 500Gi
+  resources:
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+    limits:
+      cpu: "8"
+      memory: "32Gi"
+  auth:
+    username: thor_agent
+    existingSecret: thor-clickhouse-secret
+
+# ── Redis (StatefulSet) ────────────────────────────────────────────────────
+redis:
+  enabled: true
+  architecture: standalone
+  auth:
+    existingSecret: thor-redis-secret
+  master:
+    persistence:
+      enabled: true
+      size: 10Gi
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "4Gi"
+
+# ── Monitoring (Prometheus + Grafana) ─────────────────────────────────────
+monitoring:
+  prometheus:
+    enabled: true
+    retention: "30d"
+  grafana:
+    enabled: true
+    adminExistingSecret: thor-grafana-secret
+
+# ── Network Policies (Zero-Trust) ─────────────────────────────────────────
+networkPolicies:
+  enabled: true
+  defaultDenyAll: true
+
+# ── Pod Security ───────────────────────────────────────────────────────────
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+# ── Service Account + RBAC ────────────────────────────────────────────────
+serviceAccount:
+  create: true
+  name: thor-agent
+  annotations: {}

@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "thor-firewall.fullname" . }}-agent
+  labels:
+    {{- include "thor-firewall.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+spec:
+  selector:
+    matchLabels:
+      {{- include "thor-firewall.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "thor-firewall.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      hostNetwork: {{ .Values.agent.hostNetwork }}
+      hostPID: {{ .Values.agent.hostPID }}
+      tolerations:
+        {{- toYaml .Values.agent.tolerations | nindent 8 }}
+      nodeSelector:
+        {{- toYaml .Values.agent.nodeSelector | nindent 8 }}
+      containers:
+        - name: thor-agent
+          image: "{{ .Values.global.imageRegistry }}/{{ .Values.agent.image.repository }}:{{ .Values.agent.image.tag | default .Values.global.imageTag }}"
+          imagePullPolicy: {{ .Values.global.pullPolicy }}
+          securityContext:
+            privileged: {{ .Values.agent.privileged }}
+            capabilities:
+              add:
+                {{- toYaml .Values.agent.capabilities | nindent 16 }}
+          env:
+            - name: THOR_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: THOR_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: RUST_LOG
+              value: {{ .Values.agent.env.RUST_LOG | quote }}
+            - name: THOR_GRPC_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: thor-secrets
+                  key: grpc-token
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: thor-secrets
+                  key: redis-url
+          ports:
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          volumeMounts:
+            - name: bpf-fs
+              mountPath: /sys/fs/bpf
+            - name: debugfs
+              mountPath: /sys/kernel/debug
+              readOnly: true
+            - name: config
+              mountPath: /etc/thor
+          resources:
+            {{- toYaml .Values.agent.resources | nindent 12 }}
+          livenessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 15
+            periodSeconds: 5
+      volumes:
+        - name: bpf-fs
+          hostPath:
+            path: /sys/fs/bpf
+        - name: debugfs
+          hostPath:
+            path: /sys/kernel/debug
+        - name: config
+          configMap:
+            name: {{ include "thor-firewall.fullname" . }}-agent-config
+      terminationGracePeriodSeconds: 30

@@ -1,0 +1,56 @@
+# إضافة MLflow إلى docker-compose الرئيسي
+# قم بـ merge هذا مع docker-compose.yml الرئيسي
+
+services:
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:2.11.0
+    container_name: thor-mlflow
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_data:/mlflow
+      - ./models:/models
+    environment:
+      MLFLOW_BACKEND_STORE_URI: "sqlite:////mlflow/mlflow.db"
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: "file:///mlflow/artifacts"
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - thor-net
+
+  ml-training:
+    build:
+      context: ./ml
+      dockerfile: Dockerfile
+    container_name: thor-ml-training
+    restart: "no"  # يعمل مرة واحدة ثم يتوقف
+    volumes:
+      - ./ml/data:/app/data
+      - ml_models:/models
+    environment:
+      MLFLOW_TRACKING_URI: "http://mlflow:5000"
+    command: >
+      python training/train_marl.py
+      --epochs 100
+      --batch-size 256
+      --mlflow-uri http://mlflow:5000
+      --experiment thor-marl-v1
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    networks:
+      - thor-net
+
+volumes:
+  mlflow_data:
+  ml_models:

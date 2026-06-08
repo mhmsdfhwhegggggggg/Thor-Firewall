@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "thor-firewall.fullname" . }}-ml-inference
+  labels:
+    {{- include "thor-firewall.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ml-inference
+spec:
+  replicas: {{ .Values.mlInference.replicas }}
+  selector:
+    matchLabels:
+      {{- include "thor-firewall.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ml-inference
+  template:
+    metadata:
+      labels:
+        {{- include "thor-firewall.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ml-inference
+    spec:
+      containers:
+        - name: ml-inference
+          image: "{{ .Values.global.imageRegistry }}/{{ .Values.mlInference.image.repository }}:{{ .Values.mlInference.image.tag | default .Values.global.imageTag }}"
+          imagePullPolicy: {{ .Values.global.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8082
+          env:
+            - name: PORT
+              value: "8082"
+            - name: MODEL_PATH
+              value: "/models/marl"
+            - name: MLFLOW_TRACKING_URI
+              value: "http://{{ include "thor-firewall.fullname" . }}-mlflow:5000"
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+          resources:
+            {{- toYaml .Values.mlInference.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+      {{- if .Values.mlInference.gpu.enabled }}
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      {{- end }}
+      volumes:
+        - name: model-storage
+          {{- if .Values.mlInference.modelStorage.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "thor-firewall.fullname" . }}-model-storage
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "thor-firewall.fullname" . }}-ml-inference
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8082
+      targetPort: http
+      name: http
+  selector:
+    {{- include "thor-firewall.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: ml-inference
+---
+{{- if .Values.mlInference.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "thor-firewall.fullname" . }}-ml-inference
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "thor-firewall.fullname" . }}-ml-inference
+  minReplicas: {{ .Values.mlInference.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.mlInference.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.mlInference.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}

@@ -1,0 +1,25 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: thor-firewall-staging
+  namespace: argocd
+spec:
+  project: thor-project
+  source:
+    repoURL: https://github.com/mhmsdfhwhegggggggg/Thor-Firewall.git
+    targetRevision: develop
+    path: helm/thor-firewall
+    helm:
+      releaseName: thor-staging
+      valueFiles:
+        - values.yaml
+        - values.dev.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: thor-staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

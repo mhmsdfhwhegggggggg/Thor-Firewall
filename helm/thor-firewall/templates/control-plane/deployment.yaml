@@ -1,0 +1,129 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "thor-firewall.fullname" . }}-control-plane
+  labels:
+    {{- include "thor-firewall.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+spec:
+  replicas: {{ .Values.controlPlane.replicas }}
+  selector:
+    matchLabels:
+      {{- include "thor-firewall.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: control-plane
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        {{- include "thor-firewall.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: control-plane
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: control-plane
+          image: "{{ .Values.global.imageRegistry }}/{{ .Values.controlPlane.image.repository }}:{{ .Values.controlPlane.image.tag | default .Values.global.imageTag }}"
+          imagePullPolicy: {{ .Values.global.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8000"
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: thor-secrets
+                  key: redis-url
+            - name: CLICKHOUSE_HOST
+              value: {{ include "thor-firewall.fullname" . }}-clickhouse
+            - name: ML_INFERENCE_URL
+              value: "http://{{ include "thor-firewall.fullname" . }}-ml-inference:8082"
+            - name: MISP_URL
+              valueFrom:
+                secretKeyRef:
+                  name: thor-secrets
+                  key: misp-url
+                  optional: true
+            - name: OTX_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: thor-secrets
+                  key: otx-key
+                  optional: true
+            - name: ABUSEIPDB_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: thor-secrets
+                  key: abuseipdb-key
+                  optional: true
+          resources:
+            {{- toYaml .Values.controlPlane.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/component: control-plane
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "thor-firewall.fullname" . }}-control-plane
+  labels:
+    {{- include "thor-firewall.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.controlPlane.service.type }}
+  ports:
+    - port: {{ .Values.controlPlane.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "thor-firewall.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+---
+{{- if .Values.controlPlane.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "thor-firewall.fullname" . }}-control-plane
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "thor-firewall.fullname" . }}-control-plane
+  minReplicas: {{ .Values.controlPlane.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.controlPlane.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.controlPlane.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}

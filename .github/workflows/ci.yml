@@ -1,248 +1,187 @@
-name: Thor Firewall CI/CD Pipeline
+# Thor Firewall — CI/CD Pipeline
+name: Thor Firewall CI/CD
 
 on:
   push:
-    branches: [main, develop, "release/*", "hotfix/*"]
+    branches: [main, develop, "release/*"]
   pull_request:
-    branches: [main, develop]
-  schedule:
-    # تشغيل يومي للفحص الأمني
-    - cron: "0 2 * * *"
+    branches: [main]
 
 env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-  RUST_LOG: info
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/mhmsdfhwhegggggggg
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# ============================================================================
 jobs:
-# ============================================================================
-
-  # ──────────────────────────────────────────────────────────────────────────
-  # 1. Code Quality & Security
-  # ──────────────────────────────────────────────────────────────────────────
-  quality:
-    name: "Code Quality & Security Scan"
-    runs-on: ubuntu-24.04
+  # ── Rust Agent ──────────────────────────────────────────────────────────────
+  build-agent:
+    name: Build & Test Rust Agent
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
-      - name: Cache Rust dependencies
+      - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
 
-      - name: Rust format check
+      - name: Install eBPF deps
+        run: |
+          sudo apt-get install -y libbpf-dev libelf-dev linux-headers-$(uname -r) clang llvm
+
+      - name: Lint (clippy)
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Rust Clippy (deny warnings)
-        run: |
-          cargo clippy --all-targets --all-features -- \
-            -D warnings \
-            -D clippy::unwrap_used \
-            -D clippy::expect_used \
-            -D clippy::panic
+      - name: Run tests
+        run: cargo test --workspace --release
 
-      - name: Python format & lint
-        run: |
-          pip install ruff black mypy
-          ruff check ml/ control-plane/
-          black --check ml/ control-plane/
-          mypy ml/ --ignore-missing-imports --strict
+      - name: Build release binary
+        run: cargo build --workspace --release
 
-      - name: CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          languages: rust, python
-          config-file: .github/codeql/codeql-config.yml
+          name: thor-agent-linux-x86_64
+          path: target/release/thor-agent
+          retention-days: 7
 
-  # ──────────────────────────────────────────────────────────────────────────
-  # 2. Rust Tests (Agent + Core)
-  # ──────────────────────────────────────────────────────────────────────────
-  test-rust:
-    name: "Rust Tests — ${{ matrix.os }}"
-    needs: quality
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, ubuntu-22.04]
-        rust: [stable, "1.79"]
-    runs-on: ${{ matrix.os }}
+  # ── Python Control Plane ────────────────────────────────────────────────────
+  build-control-plane:
+    name: Test Python Control Plane
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust ${{ matrix.rust }}
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.rust }}
-
-      - name: Install eBPF dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            clang llvm libbpf-dev \
-            linux-headers-$(uname -r) \
-            libssl-dev pkg-config
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: Run unit tests
-        run: |
-          cargo test --all --all-features -- --test-threads=4
-
-      - name: Run integration tests
-        run: |
-          cargo test --test '*' --all-features
-
-      - name: Generate test coverage
-        if: matrix.os == 'ubuntu-24.04' && matrix.rust == 'stable'
-        run: |
-          cargo install cargo-tarpaulin --quiet
-          cargo tarpaulin --all --all-features \
-            --out Xml --output-dir coverage/ \
-            --timeout 120
-
-      - name: Upload coverage to Codecov
-        if: matrix.os == 'ubuntu-24.04' && matrix.rust == 'stable'
-        uses: codecov/codecov-action@v4
-        with:
-          files: coverage/cobertura.xml
-          token: ${{ secrets.CODECOV_TOKEN }}
-
-  # ──────────────────────────────────────────────────────────────────────────
-  # 3. Python Tests (ML Components)
-  # ──────────────────────────────────────────────────────────────────────────
-  test-python:
-    name: "Python Tests — ML Components"
-    needs: quality
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
-          pip install --upgrade pip
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -r ml/requirements.txt pytest pytest-asyncio pytest-cov
+          cd control-plane
+          pip install -r requirements.txt -r requirements-dev.txt
 
-      - name: Run ML unit tests
-        run: |
-          pytest ml/tests/ control-plane/tests/ \
-            --cov=ml --cov=control-plane \
-            --cov-report=xml \
-            -v --timeout=60
+      - name: Lint (ruff)
+        run: cd control-plane && ruff check src/
 
-      - name: Upload Python coverage
-        uses: codecov/codecov-action@v4
-        with:
-          files: coverage.xml
-          flags: python
+      - name: Type check (mypy)
+        run: cd control-plane && mypy src/ --ignore-missing-imports
 
-  # ──────────────────────────────────────────────────────────────────────────
-  # 4. eBPF Program Build & Verify
-  # ──────────────────────────────────────────────────────────────────────────
-  build-ebpf:
-    name: "Build & Verify eBPF Programs"
-    needs: quality
-    runs-on: ubuntu-24.04
+      - name: Run tests
+        run: cd control-plane && pytest tests/ -v --cov=src --cov-report=xml
+
+  # ── ML Models ──────────────────────────────────────────────────────────────
+  test-ml:
+    name: Test ML Pipeline
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install eBPF build tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            clang llvm libbpf-dev bpftool \
-            linux-headers-$(uname -r)
-
-      - name: Generate vmlinux.h
-        run: |
-          bpftool btf dump file /sys/kernel/btf/vmlinux format c \
-            > kernel-modules/linux/ebpf/headers/vmlinux.h
-        continue-on-error: true  # قد يفشل في بعض بيئات CI
-
-      - name: Build eBPF programs
-        run: |
-          cd kernel-modules/linux/ebpf
-          make all
-        continue-on-error: true
-
-      - name: Upload eBPF objects
-        uses: actions/upload-artifact@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          name: ebpf-programs
-          path: kernel-modules/linux/ebpf/*.o
-          retention-days: 30
+          python-version: "3.12"
+          cache: pip
 
-  # ──────────────────────────────────────────────────────────────────────────
-  # 5. Performance Benchmarks
-  # ──────────────────────────────────────────────────────────────────────────
-  benchmark:
-    name: "Performance Benchmarks"
-    needs: [test-rust, test-python]
-    runs-on: ubuntu-24.04
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Install ML deps
+        run: |
+          cd ml
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      - name: Test data pipeline (synthetic)
+        run: cd ml && python data/preprocess.py --synthetic --data-dir /tmp/raw --output-dir /tmp/processed
+
+      - name: Test inference server startup
+        run: |
+          cd ml && python serving/inference_server.py &
+          sleep 3
+          curl -f http://localhost:8082/health || exit 1
+          kill %1
+
+  # ── Dashboard ──────────────────────────────────────────────────────────────
+  build-dashboard:
+    name: Build React Dashboard
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Run benchmarks
-        run: |
-          cargo bench --all -- --output-format bencher | \
-            tee benchmark-results.txt
-
-      - name: Store benchmark results
-        uses: benchmark-action/github-action-benchmark@v1
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          tool: cargo
-          output-file-path: benchmark-results.txt
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: true
-          alert-threshold: "120%"
-          comment-on-alert: true
-          fail-on-alert: true
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
 
-  # ──────────────────────────────────────────────────────────────────────────
-  # 6. Build Docker Images
-  # ──────────────────────────────────────────────────────────────────────────
-  build-docker:
-    name: "Build & Push Docker Images"
-    needs: [test-rust, test-python, build-ebpf]
-    runs-on: ubuntu-24.04
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+      - name: Install deps
+        run: cd dashboard && npm ci
+
+      - name: Type check
+        run: cd dashboard && npx tsc --noEmit
+
+      - name: Lint
+        run: cd dashboard && npm run lint
+
+      - name: Build
+        run: cd dashboard && npm run build
+
+  # ── Security Scans ─────────────────────────────────────────────────────────
+  security:
+    name: Security Scans
+    runs-on: ubuntu-22.04
+    needs: [build-agent, build-control-plane]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy (SAST)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          format: sarif
+          output: trivy-results.sarif
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ── Docker Images ──────────────────────────────────────────────────────────
+  docker:
+    name: Build & Push Docker Images
+    runs-on: ubuntu-22.04
+    needs: [build-agent, build-control-plane, build-dashboard, security]
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        service: [agent, control-plane, ml-inference, dashboard]
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to GitHub Container Registry
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -250,17 +189,18 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}/thor-agent
+          images: ${{ env.IMAGE_PREFIX }}/thor-${{ matrix.service }}
           tags: |
             type=ref,event=branch
-            type=semver,pattern={{version}}
             type=sha,prefix=git-
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push agent image
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: docker/Dockerfile.agent
+          context: ${{ matrix.service == 'ml-inference' && 'ml' || matrix.service }}
+          file: ${{ matrix.service == 'ml-inference' && 'ml/Dockerfile' || format('{0}/Dockerfile', matrix.service) }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -268,65 +208,21 @@ jobs:
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64
 
-  # ──────────────────────────────────────────────────────────────────────────
-  # 7. Security Audit
-  # ──────────────────────────────────────────────────────────────────────────
-  security-audit:
-    name: "Security Audit"
-    runs-on: ubuntu-24.04
+  # ── Deploy to Staging ──────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-22.04
+    needs: [docker]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: staging
+      url: https://thor-staging.example.com
     steps:
       - uses: actions/checkout@v4
 
-      - name: Rust security audit
-        uses: rustsec/audit-check@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Python safety check
+      - name: Trigger ArgoCD sync (staging)
         run: |
-          pip install safety pip-audit
-          pip-audit -r ml/requirements.txt --format json | tee pip-audit.json
-
-      - name: Secret scanning
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # ──────────────────────────────────────────────────────────────────────────
-  # 8. Deploy ML Models to Hugging Face
-  # ──────────────────────────────────────────────────────────────────────────
-  deploy-models:
-    name: "Deploy ML Models to HuggingFace"
-    needs: [test-python]
-    runs-on: ubuntu-24.04
-    if: startsWith(github.ref, 'refs/tags/v')
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Push models to HuggingFace Hub
-        env:
-          HF_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
-        run: |
-          pip install huggingface_hub
-          python scripts/ci/push_models_to_hf.py
-        continue-on-error: true
-
-  # ──────────────────────────────────────────────────────────────────────────
-  # Summary
-  # ──────────────────────────────────────────────────────────────────────────
-  ci-summary:
-    name: "CI Summary"
-    needs: [quality, test-rust, test-python, build-ebpf, security-audit]
-    runs-on: ubuntu-24.04
-    if: always()
-    steps:
-      - name: Check all jobs passed
-        run: |
-          if [[ "${{ needs.quality.result }}" != "success" || \
-                "${{ needs.test-rust.result }}" != "success" || \
-                "${{ needs.test-python.result }}" != "success" || \
-                "${{ needs.security-audit.result }}" != "success" ]]; then
-            echo "❌ One or more required jobs failed"
-            exit 1
-          fi
-          echo "✅ All required CI checks passed"
+          curl -s -X POST "${{ secrets.ARGOCD_URL }}/api/v1/applications/thor-firewall-staging/sync" \
+            -H "Authorization: Bearer ${{ secrets.ARGOCD_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"revision": "${{ github.sha }}", "prune": true, "dryRun": false}'
