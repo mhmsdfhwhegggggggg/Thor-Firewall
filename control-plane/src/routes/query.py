@@ -1,65 +1,137 @@
-"""Thor Firewall — Natural Language Security Query (LLM)"""
-from fastapi import APIRouter, Request, HTTPException
+"""
+Thor ThorQL — Query API Routes
+نقاط نهاية REST لتنفيذ ThorQL queries
+"""
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
+from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
-from typing import Optional
 
-router = APIRouter()
+from ..thorql.executor import ThorQLExecutor, ThorQLParser
+from ..thorql.saved_hunts import BUILT_IN_HUNTS
+
+router = APIRouter(prefix="/api/v1/query", tags=["ThorQL"])
+
+# Executor singleton (ClickHouse client injected via dependency injection later)
+_executor = ThorQLExecutor(clickhouse_client=None, soar_engine=None)
 
 
-class SecurityQuery(BaseModel):
-    question: str
-    context: Optional[str] = None
-    language: str = "ar"
+class QueryRequest(BaseModel):
+    query:     str
+    format:    str = "json"   # json | csv | table
+    explain:   bool = False    # إعادة الـ SQL المُولَّد
 
 
 class QueryResponse(BaseModel):
-    question: str
-    answer: str
-    model: str
-    latency_ms: float
+    query:        str
+    sql:          Optional[str] = None
+    rows:         list = []
+    row_count:    int = 0
+    latency_ms:   float = 0.0
+    alert_triggered: Optional[str] = None
+    soar_triggered:  Optional[str] = None
+    error:        Optional[str] = None
 
 
-@router.post("/query", response_model=QueryResponse, summary="Natural language security query")
-async def security_query(query: SecurityQuery, request: Request):
+@router.post("/execute", response_model=QueryResponse, summary="Execute a ThorQL query")
+async def execute_query(req: QueryRequest):
     """
-    Ask Thor's AI (LLM) a natural language security question.
+    نفّذ ThorQL query وأعد النتائج.
 
-    Examples:
-    - "ما هي أكثر الهجمات شيوعاً في آخر 24 ساعة؟"
-    - "هل 192.168.1.100 تصرف بشكل مشبوه؟"
-    - "اشرح لي آخر هجوم SYN flood"
+    أمثلة:
+    - `flows WHERE dst_port = 22 LAST 1h | SORT BY risk_score DESC | LIMIT 20`
+    - `threats WHERE severity = "critical" LAST 24h`
+    - `flows WHERE risk_score > 0.8 LAST 4h | GROUP BY src_ip | SORT BY count DESC`
     """
-    import time
-    start = time.time()
-
     try:
-        import httpx
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                "http://localhost:8081/v1/chat/completions",
-                json={
-                    "messages": [
-                        {"role": "system", "content": "أنت محلل أمن سيبراني خبير في نظام Thor Firewall."},
-                        {"role": "user", "content": query.question},
-                    ],
-                    "max_tokens": 512,
-                    "temperature": 0.1,
-                }
-            )
-            answer = resp.json()["choices"][0]["message"]["content"]
-            model = "mistral-7b-security"
-    except Exception:
-        # Fallback when LLM not available
-        answer = (
-            "⚠️ خادم LLM غير متاح حالياً. "
-            f"سؤالك: '{query.question}' — "
-            "يُرجى التحقق من تشغيل خادم llama.cpp على المنفذ 8081."
+        result = await _executor.execute(req.query)
+        return QueryResponse(
+            query          = req.query,
+            sql            = result["sql"] if req.explain else None,
+            rows           = result.get("rows", []),
+            row_count      = result.get("row_count", 0),
+            latency_ms     = result.get("latency_ms", 0),
+            alert_triggered= result.get("alert_triggered"),
+            soar_triggered = result.get("soar_triggered"),
         )
-        model = "fallback"
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query execution failed: {e}")
 
-    return QueryResponse(
-        question=query.question,
-        answer=answer,
-        model=model,
-        latency_ms=(time.time() - start) * 1000,
-    )
+
+@router.get("/explain", summary="Parse and explain a ThorQL query without executing")
+async def explain_query(q: str):
+    """
+    حلّل ThorQL query وأعد الـ SQL المُولَّد بدون تنفيذ.
+    مفيد للتحقق من صحة الـ query قبل التنفيذ.
+    """
+    parser     = ThorQLParser()
+    from ..thorql.executor import ThorQLTranspiler
+    transpiler = ThorQLTranspiler()
+    try:
+        pq  = parser.parse(q)
+        sql = transpiler.to_sql(pq)
+        return {
+            "original":  q,
+            "parsed": {
+                "source":       pq.source,
+                "table":        pq.table,
+                "where":        pq.where_clauses,
+                "time_window":  pq.time_seconds,
+                "group_by":     pq.group_by,
+                "sort_by":      pq.sort_by,
+                "sort_desc":    pq.sort_desc,
+                "limit":        pq.limit,
+                "has_enrich":   pq.enrich,
+                "has_alert":    pq.alert_msg is not None,
+                "has_soar":     pq.soar_action is not None,
+            },
+            "generated_sql": sql,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/hunts", summary="List built-in threat hunting queries")
+async def list_hunts():
+    """
+    أعد مكتبة استعلامات الصيد الجاهزة.
+    كل استعلام مرتبط بـ MITRE ATT&CK ID.
+    """
+    return {
+        "hunts": [
+            {
+                "id":          hid,
+                "name":        h.name,
+                "description": h.description,
+                "mitre_id":    h.mitre_id,
+                "severity":    h.severity,
+                "query":       h.query.strip(),
+            }
+            for hid, h in BUILT_IN_HUNTS.items()
+        ],
+        "total": len(BUILT_IN_HUNTS),
+    }
+
+
+@router.post("/hunts/{hunt_id}/execute", summary="Execute a saved threat hunt")
+async def execute_hunt(hunt_id: str):
+    """نفّذ استعلام صيد محفوظ"""
+    if hunt_id not in BUILT_IN_HUNTS:
+        raise HTTPException(status_code=404,
+                             detail=f"Hunt '{hunt_id}' not found. Available: {list(BUILT_IN_HUNTS.keys())}")
+    hunt = BUILT_IN_HUNTS[hunt_id]
+    try:
+        result = await _executor.execute(hunt.query.strip())
+        return {
+            "hunt_id":    hunt_id,
+            "hunt_name":  hunt.name,
+            "mitre_id":   hunt.mitre_id,
+            "rows":       result.get("rows", []),
+            "row_count":  result.get("row_count", 0),
+            "latency_ms": result.get("latency_ms", 0),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
