@@ -1,0 +1,56 @@
+# Thor Firewall — eBPF Build Container
+# Compiles XDP/BPF programs in an isolated environment.
+# Does NOT require a local clang installation.
+#
+# Usage:
+#   docker build -f docker/Dockerfile.ebpf -t thor-ebpf-builder:latest .
+#   docker run --rm -v $(pwd):/work -w /work thor-ebpf-builder:latest \
+#       cargo xtask build-ebpf --release
+
+FROM ubuntu:22.04 AS ebpf-builder
+
+LABEL maintainer="Thor Firewall" \
+      description="eBPF/XDP compilation environment for Thor Firewall"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LLVM_VERSION=17
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Core build tools
+    build-essential \
+    pkg-config \
+    # LLVM/Clang for BPF target
+    clang-${LLVM_VERSION} \
+    llvm-${LLVM_VERSION} \
+    llvm-${LLVM_VERSION}-dev \
+    libclang-${LLVM_VERSION}-dev \
+    # libbpf
+    libbpf-dev \
+    # Kernel headers (for BTF/vmlinux)
+    linux-headers-generic \
+    linux-tools-generic \
+    # bpftool for skeleton generation
+    linux-tools-$(uname -r 2>/dev/null || echo generic) \
+    # Rust toolchain prerequisites
+    curl \
+    ca-certificates \
+    && ln -sf /usr/bin/clang-${LLVM_VERSION}    /usr/local/bin/clang \
+    && ln -sf /usr/bin/llvm-strip-${LLVM_VERSION} /usr/local/bin/llvm-strip \
+    && ln -sf /usr/bin/llvm-objdump-${LLVM_VERSION} /usr/local/bin/llvm-objdump \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust toolchain (for xtask)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- \
+    -y --default-toolchain stable --profile minimal \
+    && /root/.cargo/bin/rustup target add x86_64-unknown-linux-musl
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /work
+
+# Pre-warm cargo registry cache (optional — speeds up first build)
+# COPY Cargo.toml Cargo.lock ./
+# RUN cargo fetch
+
+# Default command: build eBPF programs
+CMD ["cargo", "xtask", "build-ebpf", "--release"]
