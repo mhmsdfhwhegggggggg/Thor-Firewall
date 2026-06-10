@@ -3,24 +3,20 @@
 //!
 //! يرسل batch requests إلى ML inference server (Python FastAPI)
 //! ويستقبل القرارات (BLOCK/ALLOW + risk score + threat type)
-//!
-//! SPDX-License-Identifier: MIT
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
 
-// ── Action Types ─────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum FlowAction {
-    Allow   = 0,
-    Block   = 1,
-    Monitor = 2,
-    Throttle= 3,
-    Redirect= 4,
+    Allow    = 0,
+    Block    = 1,
+    Monitor  = 2,
+    Throttle = 3,
+    Redirect = 4,
 }
 
 impl std::fmt::Display for FlowAction {
@@ -56,23 +52,34 @@ struct FlowDecision {
 
 #[derive(Debug, Deserialize)]
 struct BatchResponse {
-    decisions:          Vec<FlowDecision>,
-    batch_size:         usize,
-    inference_time_ms:  f64,
-    model_version:      String,
+    decisions:         Vec<FlowDecision>,
+    batch_size:        usize,
+    inference_time_ms: f64,
+    model_version:     String,
 }
 
 // ── RL Core ──────────────────────────────────────────────────────────────────
 
 pub struct ThorRLCore {
-    ml_url:    String,
-    http:      reqwest::Client,
-    /// نقطة نهاية batch inference
-    endpoint:  String,
+    ml_url:     String,
+    api_url:    String,
+    api_key:    String,
+    batch_size: usize,
+    http:       reqwest::Client,
+    endpoint:   String,
 }
 
 impl ThorRLCore {
-    pub async fn new(ml_url: &str) -> Result<Self> {
+    /// ml_url     — ML inference server URL  (e.g. "http://thor-ml:8082")
+    /// api_url    — Control plane URL         (e.g. "http://thor-control-plane:8000")
+    /// api_key    — X-API-Key for auth
+    /// batch_size — Maximum flows per ML call
+    pub async fn new(
+        ml_url:     &str,
+        api_url:    &str,
+        api_key:    &str,
+        batch_size: usize,
+    ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_millis(200))
             .pool_max_idle_per_host(32)
@@ -83,23 +90,30 @@ impl ThorRLCore {
         let endpoint = format!("{}/v1/analyze/batch", ml_url.trim_end_matches('/'));
 
         let core = Self {
-            ml_url: ml_url.to_string(),
+            ml_url:  ml_url.to_string(),
+            api_url: api_url.to_string(),
+            api_key: api_key.to_string(),
+            batch_size,
             http,
             endpoint,
         };
 
-        // Connection check (non-fatal)
         if let Err(e) = core.health_check().await {
-            warn!("ML inference not reachable at startup: {} — will retry on demand", e);
+            warn!(
+                "ML inference not reachable at startup: {} — will retry on demand", e
+            );
         }
 
         Ok(core)
     }
 
-    /// فحص صحة الاتصال بـ ML inference server
     pub async fn health_check(&self) -> Result<()> {
         let url = format!("{}/health", self.ml_url.trim_end_matches('/'));
-        let resp = self.http.get(&url).send().await
+        let resp = self.http
+            .get(&url)
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await
             .context("ML health check request failed")?;
         if !resp.status().is_success() {
             anyhow::bail!("ML health check returned {}", resp.status());
@@ -117,15 +131,37 @@ impl ThorRLCore {
             return Ok(vec![]);
         }
 
+        // إذا كان الـ batch أكبر من الحد، قسّمه
+        if features.len() > self.batch_size {
+            let mut results = Vec::with_capacity(features.len());
+            for (chunk_f, chunk_id) in features
+                .chunks(self.batch_size)
+                .zip(flow_ids.chunks(self.batch_size))
+            {
+                let partial = self._send_batch(chunk_f, chunk_id).await?;
+                results.extend(partial);
+            }
+            return Ok(results);
+        }
+
+        self._send_batch(features, flow_ids).await
+    }
+
+    async fn _send_batch(
+        &self,
+        features: &[Vec<f32>],
+        flow_ids: &[String],
+    ) -> Result<Vec<(FlowAction, f32, Option<String>)>> {
         let t0 = Instant::now();
 
         let body = BatchRequest {
-            flows: features.to_vec(),
+            flows:    features.to_vec(),
             flow_ids: flow_ids.to_vec(),
         };
 
         let resp = self.http
             .post(&self.endpoint)
+            .header("X-API-Key", &self.api_key)
             .json(&body)
             .send()
             .await
@@ -133,8 +169,12 @@ impl ThorRLCore {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("ML inference returned {}: {}", status, &body[..body.len().min(200)]);
+            let body_text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "ML inference returned {}: {}",
+                status,
+                &body_text[..body_text.len().min(200)]
+            );
         }
 
         let batch: BatchResponse = resp.json().await
@@ -142,13 +182,13 @@ impl ThorRLCore {
 
         let elapsed = t0.elapsed();
         debug!(
-            "ML batch: {} flows | inference={:.3}ms | total={:.3}ms",
+            "ML batch: {} flows | inference={:.3}ms | total={:.3}ms | model={}",
             batch.batch_size,
             batch.inference_time_ms,
             elapsed.as_secs_f64() * 1000.0,
+            batch.model_version,
         );
 
-        // Record Prometheus histogram
         metrics::histogram!(
             "thor_rl_decision_latency_ms",
             elapsed.as_secs_f64() * 1000.0
@@ -158,12 +198,12 @@ impl ThorRLCore {
             .decisions
             .into_iter()
             .map(|d| {
-                let action = if d.blocked || d.risk_score > 0.85 {
-                    FlowAction::Block
-                } else if d.risk_score > 0.5 {
-                    FlowAction::Monitor
-                } else {
-                    FlowAction::Allow
+                let action = match d.action {
+                    _ if d.blocked => FlowAction::Block,
+                    _ if d.risk_score > 0.85 => FlowAction::Block,
+                    _ if d.risk_score > 0.60 => FlowAction::Monitor,
+                    _ if d.risk_score > 0.40 => FlowAction::Throttle,
+                    _ => FlowAction::Allow,
                 };
                 (action, d.risk_score, d.threat_type)
             })
@@ -172,23 +212,20 @@ impl ThorRLCore {
         Ok(results)
     }
 
-    /// تحليل flow واحد (wrapper فوق analyze_batch)
     pub async fn analyze_single(
         &self,
         features: Vec<f32>,
         flow_id: &str,
     ) -> Result<(FlowAction, f32, Option<String>)> {
-        let results = self.analyze_batch(
-            &[features],
-            &[flow_id.to_string()],
-        ).await?;
-
-        results.into_iter().next()
+        let results = self
+            .analyze_batch(&[features], &[flow_id.to_string()])
+            .await?;
+        results
+            .into_iter()
+            .next()
             .ok_or_else(|| anyhow::anyhow!("Empty batch response"))
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -203,9 +240,12 @@ mod tests {
     #[tokio::test]
     async fn test_empty_batch() {
         let core = ThorRLCore {
-            ml_url: "http://localhost:8082".to_string(),
-            http: reqwest::Client::new(),
-            endpoint: "http://localhost:8082/v1/analyze/batch".to_string(),
+            ml_url:     "http://localhost:8082".into(),
+            api_url:    "http://localhost:8000".into(),
+            api_key:    "test_key".into(),
+            batch_size: 64,
+            http:       reqwest::Client::new(),
+            endpoint:   "http://localhost:8082/v1/analyze/batch".into(),
         };
         let result = core.analyze_batch(&[], &[]).await.unwrap();
         assert!(result.is_empty());
