@@ -1,115 +1,114 @@
 """
-Thor Firewall — Authentication Middleware
-middleware للتحقق من JWT في كل request
-
-يدعم:
-- Bearer token في Authorization header
-- X-API-Key header للـ agents
-- Whitelist للمسارات العامة (/health, /docs, /api/auth/*)
-
-SPDX-License-Identifier: MIT
+Thor Firewall — Auth Middleware (Real PostgreSQL)
+Replaces the mock API keys store with real DB lookup.
 """
 from __future__ import annotations
+
+import hashlib
 import logging
-from typing import Optional
+import time
 
-from fastapi import HTTPException, Request, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import Request, HTTPException
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..auth.jwt_handler import TokenPayload, verify_token, verify_api_key
-from ..auth.rbac import UserRole
+from ..auth.jwt_handler import verify_token
+from ..db.models import APIKey, User, AuditLog
+from ..db.session import get_session_factory
 
-logger = logging.getLogger("thor.middleware.auth")
+logger = logging.getLogger("thor.auth_middleware")
 
-security = HTTPBearer(auto_error=False)
-
-# مسارات مستثناة من التوثيق
-PUBLIC_PATHS = {
+# Routes that don't require authentication
+PUBLIC_ROUTES = {
     "/api/auth/login",
     "/api/auth/refresh",
-    "/api/health",
+    "/healthz",
     "/health",
+    "/readyz",
+    "/metrics",
     "/docs",
     "/openapi.json",
     "/redoc",
-    "/metrics",
 }
 
-# Mock API keys store (استبدل بـ DB في الإنتاج)
-_API_KEYS: dict[str, dict] = {}  # hashed_key → {agent_id, node_name, role}
 
-def register_agent_key(hashed_key: str, agent_id: str, node_name: str):
-    _API_KEYS[hashed_key] = {
-        "agent_id": agent_id,
-        "node_name": node_name,
-        "role": UserRole.AGENT,
-    }
+def _key_prefix(api_key: str) -> str:
+    return api_key[:8] if len(api_key) >= 8 else api_key
 
 
-async def get_current_user(request: Request) -> Optional[TokenPayload]:
-    """استخراج والتحقق من هوية المستخدم الحالي"""
-    path = request.url.path
-    if path in PUBLIC_PATHS or path.startswith("/api/auth/"):
-        return None
-
-    # 1. Bearer JWT
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        token = auth_header[7:]
-        try:
-            return verify_token(token)
-        except ValueError as e:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=str(e),
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-
-    # 2. X-API-Key (للـ agents)
-    api_key = request.headers.get("X-API-Key", "")
-    if api_key:
-        import hashlib
-        hashed = hashlib.sha256(api_key.encode()).hexdigest()
-        agent = _API_KEYS.get(hashed)
-        if agent:
-            import time, secrets
-            return TokenPayload(
-                sub=agent["agent_id"],
-                role=agent["role"],
-                email=None,
-                exp=int(time.time()) + 3600,
-                iat=int(time.time()),
-                jti=secrets.token_hex(8),
-                token_type="agent",
-            )
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key",
-        )
-
-    # 3. لا يوجد توثيق
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Authentication required",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+def _key_hash(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode()).hexdigest()
 
 
 async def auth_middleware(request: Request, call_next):
-    """Starlette middleware — يُضيف current_user إلى request.state"""
+    """
+    FastAPI middleware — validates JWT Bearer or X-API-Key.
+    Looks up API keys in PostgreSQL (not in-memory mock).
+    """
     path = request.url.path
-    if path in PUBLIC_PATHS or path.startswith("/api/auth/"):
+
+    # Pass through public routes
+    if path in PUBLIC_ROUTES or path.startswith("/docs") or path.startswith("/static"):
         return await call_next(request)
 
-    try:
-        user = await get_current_user(request)
-        request.state.user = user
-    except HTTPException as e:
-        from fastapi.responses import JSONResponse
-        return JSONResponse(
-            status_code=e.status_code,
-            content={"detail": e.detail},
-            headers=e.headers or {},
-        )
+    # ── Option A: Bearer JWT ──────────────────────────────────────────────────
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        payload = verify_token(token)
+        if payload:
+            request.state.user_id   = payload.get("sub")
+            request.state.user_role = payload.get("role", "viewer")
+            request.state.user_email = payload.get("email", "")
+            return await call_next(request)
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-    return await call_next(request)
+    # ── Option B: X-API-Key header ────────────────────────────────────────────
+    api_key = request.headers.get("X-API-Key", "")
+    if api_key:
+        prefix   = _key_prefix(api_key)
+        key_hash = _key_hash(api_key)
+
+        async with get_session_factory()() as db:
+            result = await db.execute(
+                select(APIKey)
+                .where(
+                    APIKey.key_prefix == prefix,
+                    APIKey.key_hash   == key_hash,
+                    APIKey.is_active  == True,
+                )
+            )
+            key_obj = result.scalar_one_or_none()
+
+        if key_obj:
+            # Get owner user
+            async with get_session_factory()() as db:
+                u = await db.execute(select(User).where(User.id == key_obj.user_id))
+                user = u.scalar_one_or_none()
+
+            if user and user.is_active:
+                request.state.user_id    = str(user.id)
+                request.state.user_role  = user.role.value
+                request.state.user_email = user.email
+                request.state.api_key_id = str(key_obj.id)
+
+                # Update last_used asynchronously (don't block request)
+                from sqlalchemy import update
+                from datetime import datetime, timezone
+                ip = request.client.host if request.client else None
+                try:
+                    async with get_session_factory()() as db:
+                        await db.execute(
+                            update(APIKey).where(APIKey.id == key_obj.id).values(
+                                last_used=datetime.now(timezone.utc), last_ip=ip,
+                            )
+                        )
+                        await db.commit()
+                except Exception:
+                    pass
+
+                return await call_next(request)
+
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    raise HTTPException(status_code=401, detail="Authentication required")
