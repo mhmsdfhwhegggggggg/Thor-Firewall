@@ -20,6 +20,19 @@ networks:
     driver: bridge
 
 volumes:
+  kafka_data:
+  zookeeper_data:
+  zookeeper_log:
+  tempo_data:
+  opencti_data:
+  opencti_es_data:
+  minio_data:
+  rabbitmq_data:
+  thehive_data:
+  thehive_db_data:
+  wazuh_data:
+  wazuh_logs:
+  wazuh_queue:
   clickhouse_data:
   redis_data:
   timescaledb_data:
@@ -565,3 +578,244 @@ services:
     networks:
       - thor-obs-net
       - thor-net
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STREAMING — Apache Kafka + Zookeeper
+# Real: https://github.com/apache/kafka
+# ─────────────────────────────────────────────────────────────────────────────
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.7.1
+    container_name: thor-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+    networks: [thor-net]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    container_name: thor-kafka
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "9101:9101"   # JMX metrics
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+      # Auto-create Thor topics
+      KAFKA_CREATE_TOPICS: "thor.flows:8:1,thor.alerts:4:1,thor.ml.decisions:4:1,thor.threat.intel:2:1"
+      # Retention: 48h for flows, 7d for alerts
+      KAFKA_LOG_RETENTION_HOURS: 48
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks: [thor-net]
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: thor-kafka-ui
+    restart: unless-stopped
+    depends_on: [kafka]
+    ports:
+      - "8089:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: thor-kafka
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks: [thor-net]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OBSERVABILITY — Grafana Tempo (distributed tracing)
+# Real: https://github.com/grafana/tempo
+# ─────────────────────────────────────────────────────────────────────────────
+
+  tempo:
+    image: grafana/tempo:2.6.0
+    container_name: thor-tempo
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    ports:
+      - "3200:3200"    # Tempo HTTP
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+      - "9411:9411"    # Zipkin
+      - "14268:14268"  # Jaeger HTTP thrift
+    volumes:
+      - ./monitoring/tempo/tempo-config.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo_data:/tmp/tempo
+    networks: [thor-obs-net]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3200/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THREAT INTEL — OpenCTI Platform
+# Real: https://github.com/OpenCTI-Platform/opencti
+# ─────────────────────────────────────────────────────────────────────────────
+
+  opencti:
+    image: opencti/platform:6.3.7
+    container_name: thor-opencti
+    restart: unless-stopped
+    profiles: ["full"]
+    depends_on:
+      - opencti-db
+      - redis
+      - minio
+      - rabbitmq
+    ports:
+      - "8080:8080"
+    environment:
+      NODE_OPTIONS: "--max-old-space-size=8096"
+      APP__PORT: 8080
+      APP__BASE_URL: "http://localhost:8080"
+      APP__ADMIN__EMAIL: "${OPENCTI_ADMIN_EMAIL:-admin@thor.io}"
+      APP__ADMIN__PASSWORD: "${OPENCTI_ADMIN_PASSWORD:-thor_opencti_admin}"
+      APP__ADMIN__TOKEN: "${OPENCTI_ADMIN_TOKEN:-thor_api_token_placeholder}"
+      REDIS__HOSTNAME: redis
+      REDIS__PORT: 6379
+      ELASTICSEARCH__URL: http://elasticsearch:9200
+      MINIO__ENDPOINT: minio
+      MINIO__PORT: 9000
+      MINIO__USE_SSL: "false"
+      MINIO__ACCESS_KEY: "${MINIO_ACCESS_KEY:-thor_minio_key}"
+      MINIO__SECRET_KEY: "${MINIO_SECRET_KEY:-thor_minio_secret}"
+      RABBITMQ__HOSTNAME: rabbitmq
+      RABBITMQ__PORT: 5672
+      RABBITMQ__USERNAME: "${RABBITMQ_USER:-thor}"
+      RABBITMQ__PASSWORD: "${RABBITMQ_PASS:-thor_rmq}"
+      SMTP__HOSTNAME: localhost
+      PROVIDERS__LOCAL__STRATEGY: LocalStrategy
+    volumes:
+      - opencti_data:/opt/opencti-data
+    networks: [thor-net]
+
+  opencti-db:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: thor-opencti-es
+    profiles: ["full"]
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms2g -Xmx2g"
+    volumes:
+      - opencti_es_data:/usr/share/elasticsearch/data
+    networks: [thor-net]
+
+  minio:
+    image: minio/minio:RELEASE.2024-01-13T07-53-03Z
+    container_name: thor-minio
+    profiles: ["full"]
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ACCESS_KEY:-thor_minio_key}"
+      MINIO_ROOT_PASSWORD: "${MINIO_SECRET_KEY:-thor_minio_secret}"
+    volumes:
+      - minio_data:/data
+    networks: [thor-net]
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: thor-rabbitmq
+    profiles: ["full"]
+    environment:
+      RABBITMQ_DEFAULT_USER: "${RABBITMQ_USER:-thor}"
+      RABBITMQ_DEFAULT_PASS: "${RABBITMQ_PASS:-thor_rmq}"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks: [thor-net]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INCIDENT RESPONSE — TheHive
+# Real: https://github.com/TheHive-Project/TheHive
+# ─────────────────────────────────────────────────────────────────────────────
+
+  thehive:
+    image: thehiveproject/thehive:5.3
+    container_name: thor-thehive
+    profiles: ["full"]
+    depends_on: [opencti-db]
+    ports:
+      - "9000:9000"
+    environment:
+      TH_SECRET: "${THEHIVE_SECRET:-thor_thehive_secret_change_me}"
+      TH_DB_HOST: thehive-db
+      TH_DB_PORT: 5432
+      TH_DB_NAME: thehive
+      TH_DB_USER: thehive
+      TH_DB_PASSWORD: "${THEHIVE_DB_PASSWORD:-thehive_pass}"
+    networks: [thor-net]
+    volumes:
+      - thehive_data:/opt/thehive/data
+
+  thehive-db:
+    image: postgres:16-alpine
+    container_name: thor-thehive-db
+    profiles: ["full"]
+    environment:
+      POSTGRES_DB: thehive
+      POSTGRES_USER: thehive
+      POSTGRES_PASSWORD: "${THEHIVE_DB_PASSWORD:-thehive_pass}"
+    volumes:
+      - thehive_db_data:/var/lib/postgresql/data
+    networks: [thor-net]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT SECURITY — Wazuh SIEM/XDR
+# Real: https://github.com/wazuh/wazuh
+# ─────────────────────────────────────────────────────────────────────────────
+
+  wazuh-manager:
+    image: wazuh/wazuh-manager:4.9.0
+    container_name: thor-wazuh
+    profiles: ["endpoint"]
+    ports:
+      - "1514:1514"   # Agent connections
+      - "1515:1515"   # Agent enrollment
+      - "514:514/udp" # Syslog
+      - "55000:55000" # REST API
+    environment:
+      WAZUH_API_USERNAME: wazuh-wui
+      WAZUH_API_PASSWORD: "${WAZUH_API_PASSWORD:-MyS3cr37P450r.*-}"
+    volumes:
+      - wazuh_data:/var/ossec/data
+      - wazuh_logs:/var/ossec/logs
+      - wazuh_queue:/var/ossec/queue
+    networks: [thor-net]
+    healthcheck:
+      test: ["CMD-SHELL", "/var/ossec/bin/wazuh-control status | grep 'wazuh-execd' | grep -q running"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+

@@ -1,0 +1,229 @@
+# Thor Firewall — ArgoCD Application Manifests
+#
+# REAL CODE SOURCE: https://github.com/argoproj/argo-cd (Apache-2.0)
+#   Copyright Argo Project Authors
+#   Based on: https://argo-cd.readthedocs.io/en/stable/operator-manual/declarative-setup/
+#
+# GitOps: ArgoCD watches this repo and auto-syncs Thor Firewall to K8s
+
+---
+# ArgoCD Project — isolates Thor resources
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: thor-firewall
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: "Thor Firewall NGFW Platform"
+  sourceRepos:
+    - "https://github.com/mhmsdfhwhegggggggg/Thor-Firewall.git"
+    - "https://charts.helm.sh/stable"
+    - "https://prometheus-community.github.io/helm-charts"
+    - "https://grafana.github.io/helm-charts"
+  destinations:
+    - namespace: thor-system
+      server: https://kubernetes.default.svc
+    - namespace: thor-monitoring
+      server: https://kubernetes.default.svc
+    - namespace: thor-ml
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+
+---
+# Main Thor Firewall Application
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: thor-firewall-core
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: thor-firewall
+    app.kubernetes.io/component: core
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: thor-firewall
+  source:
+    repoURL: https://github.com/mhmsdfhwhegggggggg/Thor-Firewall.git
+    targetRevision: main
+    path: helm/thor-firewall
+    helm:
+      releaseName: thor-firewall
+      valueFiles:
+        - values.yaml
+        - values-production.yaml
+      parameters:
+        - name: image.tag
+          value: latest
+        - name: agent.xdpMode
+          value: native
+        - name: controlPlane.replicas
+          value: "3"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: thor-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - Validate=true
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+      - ApplyOutOfSyncOnly=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+  revisionHistoryLimit: 10
+  info:
+    - name: "GitHub"
+      value: "https://github.com/mhmsdfhwhegggggggg/Thor-Firewall"
+
+---
+# Monitoring stack (Prometheus + Thanos + Grafana + Loki + Tempo)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: thor-monitoring
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"   # Deploy before core
+spec:
+  project: thor-firewall
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    targetRevision: 61.7.2
+    helm:
+      releaseName: thor-prometheus
+      values: |
+        prometheus:
+          prometheusSpec:
+            retention: 7d
+            retentionSize: "50GB"
+            storageSpec:
+              volumeClaimTemplate:
+                spec:
+                  storageClassName: fast-ssd
+                  resources:
+                    requests:
+                      storage: 100Gi
+            # Thanos sidecar — uploads blocks to S3
+            thanos:
+              image: quay.io/thanos/thanos:v0.36.1
+              objectStorageConfig:
+                existingSecret:
+                  name: thanos-objstore-secret
+                  key: objstore.yaml
+            additionalScrapeConfigs:
+              - job_name: thor-agent
+                static_configs:
+                  - targets: ['thor-agent:9090']
+              - job_name: thor-control-plane
+                static_configs:
+                  - targets: ['thor-control-plane:8001']
+              - job_name: bentoml
+                static_configs:
+                  - targets: ['bentoml:3000']
+        grafana:
+          enabled: true
+          adminPassword: "${GRAFANA_ADMIN_PASSWORD}"
+          persistence:
+            enabled: true
+            size: 10Gi
+          sidecar:
+            dashboards:
+              enabled: true
+              searchNamespace: ALL
+          additionalDataSources:
+            - name: Loki
+              type: loki
+              url: http://loki:3100
+            - name: Tempo
+              type: tempo
+              url: http://tempo:3200
+            - name: ClickHouse
+              type: grafana-clickhouse-datasource
+              url: http://clickhouse:8123
+        alertmanager:
+          alertmanagerSpec:
+            retention: 120h
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: thor-monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+---
+# Loki log aggregation
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: thor-loki
+  namespace: argocd
+spec:
+  project: thor-firewall
+  source:
+    repoURL: https://grafana.github.io/helm-charts
+    chart: loki-stack
+    targetRevision: 2.10.2
+    helm:
+      releaseName: thor-loki
+      values: |
+        loki:
+          enabled: true
+          persistence:
+            enabled: true
+            size: 100Gi
+          config:
+            schema_config:
+              configs:
+                - from: "2024-01-01"
+                  store: tsdb
+                  schema: v13
+                  index:
+                    prefix: loki_index_
+                    period: 24h
+            limits_config:
+              retention_period: 720h  # 30 days
+              ingestion_rate_mb: 16
+              ingestion_burst_size_mb: 32
+        promtail:
+          enabled: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: thor-monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

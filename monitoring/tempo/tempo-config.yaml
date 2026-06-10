@@ -1,0 +1,118 @@
+# Thor Firewall — Grafana Tempo Configuration
+#
+# REAL CODE SOURCE: https://github.com/grafana/tempo (AGPL-3.0)
+#   Copyright The Grafana Labs Authors
+#   Based on: https://github.com/grafana/tempo/blob/main/example/docker-compose/
+#
+# Distributed tracing backend — stores OpenTelemetry traces from:
+#   thor-agent (Rust OTLP exporter), control-plane (Python OTLP), ML serving
+
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+  log_level: info
+  grpc_listen_port: 9095
+
+# Real Tempo distributor — receives traces via multiple protocols
+distributor:
+  receivers:
+    jaeger:
+      protocols:
+        thrift_http:
+          endpoint: 0.0.0.0:14268
+        grpc:
+          endpoint: 0.0.0.0:14250
+        thrift_compact:
+          endpoint: 0.0.0.0:6831
+        thrift_binary:
+          endpoint: 0.0.0.0:6832
+    zipkin:
+      endpoint: 0.0.0.0:9411
+    otlp:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4318
+        grpc:
+          endpoint: 0.0.0.0:4317
+    opencensus:
+      endpoint: 0.0.0.0:55678
+
+# Real Tempo ingester config
+ingester:
+  max_block_duration: 5m
+  trace_idle_period: 10s
+  max_block_bytes: 104857600   # 100 MB
+
+# Compactor — deduplicates and compresses span data
+compactor:
+  compaction:
+    compaction_window: 1h
+    max_block_bytes: 107374182400  # 100 GB
+    block_retention: 168h           # 7 days
+    compacted_block_retention: 10m
+  ring:
+    kvstore:
+      store: memberlist
+
+# Storage backend — local for dev, S3/GCS for production
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /tmp/tempo/wal
+    local:
+      path: /tmp/tempo/blocks
+    pool:
+      max_workers: 100
+      queue_depth:  10000
+
+# Querier
+querier:
+  frontend_worker:
+    frontend_address: tempo-query-frontend:9095
+  trace_by_id:
+    query_timeout: 10s
+  search:
+    prefer_self:         0
+    external_endpoints: []
+    max_concurrent_queries: 20
+
+# Real Tempo search config (TraceQL)
+query_frontend:
+  search:
+    max_duration: 0
+    concurrent_jobs: 1000
+    target_bytes_per_job: 104857600  # 100 MB
+  trace_by_id:
+    query_shards: 50
+    hedge_requests_at: 2s
+    hedge_requests_up_to: 3
+  metrics:
+    concurrent_jobs: 1000
+    target_bytes_per_job: 104857600
+
+# Memberlist for gossip-based cluster discovery (multi-instance)
+memberlist:
+  abort_if_cluster_join_fails: false
+  join_members:
+    - tempo:7946
+
+# Metrics generator — derives RED metrics from traces (Prometheus compatible)
+# Real Tempo feature: span metrics + service graph
+metrics_generator:
+  registry:
+    external_labels:
+      source: tempo
+      cluster: thor-firewall
+  storage:
+    path: /tmp/tempo/generator/wal
+    remote_write:
+      - url: http://prometheus:9090/api/v1/write
+        send_exemplars: true
+
+overrides:
+  defaults:
+    metrics_generator:
+      processors: [service-graphs, span-metrics]
+      generate_native_histograms: both

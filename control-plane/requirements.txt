@@ -85,3 +85,28 @@ aiofiles==24.1.0
 cryptography==43.0.3
 hashids==1.3.1
 arrow==1.3.0
+
+# YARA (VirusTotal/yara-python — real YARA C library bindings)
+yara-python==4.5.1
+
+# OpenCTI (OpenCTI-Platform/client-python — real STIX 2.1 API)
+pycti==6.3.7
+
+# Kafka (confluent-kafka — real librdkafka bindings)
+confluent-kafka==2.5.0
+
+# Apache Druid REST client (druid-query-toolkit)
+pydruid==0.6.7
+
+# Velociraptor gRPC client
+grpcio==1.65.5
+grpcio-tools==1.65.5
+
+# Wazuh API client
+wazuh==4.8.1
+
+# TheHive4py (TheHive-Project/TheHive4py)
+thehive4py==1.8.1
+
+# Velociraptor REST client
+httpx==0.27.2

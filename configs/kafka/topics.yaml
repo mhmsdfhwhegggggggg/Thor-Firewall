@@ -1,0 +1,60 @@
+# Thor Firewall — Kafka Topics Configuration
+# Real: https://github.com/apache/kafka
+#
+# Apply with: kafka-topics.sh --bootstrap-server localhost:9092 --create ...
+
+topics:
+  - name: thor.flows
+    partitions: 8
+    replication_factor: 1
+    config:
+      retention.ms: 172800000      # 48h
+      segment.ms: 3600000          # 1h segments
+      compression.type: lz4
+      cleanup.policy: delete
+      max.message.bytes: 1048576   # 1 MB per flow batch
+      # ClickHouse Kafka engine reads from this topic
+      # Schema: KafkaFlowEvent (JSON)
+
+  - name: thor.alerts
+    partitions: 4
+    replication_factor: 1
+    config:
+      retention.ms: 604800000      # 7 days (alerts kept longer)
+      compression.type: gzip
+      cleanup.policy: delete
+      # TheHive + OpenCTI subscribe to this topic
+
+  - name: thor.ml.decisions
+    partitions: 4
+    replication_factor: 1
+    config:
+      retention.ms: 3600000        # 1h (fast feedback loop)
+      compression.type: lz4
+      # BentoML publishes risk scores here
+      # thor-agent (rdkafka consumer) reads and updates BPF ml_decisions map
+
+  - name: thor.threat.intel
+    partitions: 2
+    replication_factor: 1
+    config:
+      retention.ms: 86400000       # 24h
+      cleanup.policy: compact       # Keep latest IOC per key
+      # OpenCTI connector publishes new IOCs here
+      # control-plane reads and updates Redis + Sigma rules
+
+  - name: thor.sigma.hits
+    partitions: 4
+    replication_factor: 1
+    config:
+      retention.ms: 2592000000     # 30 days
+      compression.type: gzip
+      # Sigma rule matches pushed by control-plane
+
+  - name: thor.yara.matches
+    partitions: 2
+    replication_factor: 1
+    config:
+      retention.ms: 2592000000     # 30 days
+      compression.type: gzip
+      # YARA scan hits from DPI engine

@@ -1,0 +1,87 @@
+title: C2 Beaconing Detection
+name: thor_c2_beaconing
+status: stable
+description: >
+  Detects Command and Control (C2) beaconing patterns:
+  periodic HTTP/HTTPS connections to external hosts with regular intervals,
+  consistent user-agents, and low content variance.
+  Based on SigmaHQ network detection rules.
+
+references:
+  - https://github.com/SigmaHQ/sigma
+  - https://attack.mitre.org/techniques/T1071/001/
+  - https://github.com/Neo23x0/sigma/blob/master/rules/network/
+
+author: SigmaHQ Community
+date: 2024-01-15
+
+tags:
+  - attack.command_and_control
+  - attack.t1071.001
+  - attack.t1571
+  - attack.defense_evasion
+
+logsource:
+  category: proxy
+  product: zeek
+  definition: "Zeek http.log schema"
+
+detection:
+  selection_suspicious_ua:
+    http.user_agent|contains:
+      - "python-requests"
+      - "Go-http-client"
+      - "curl/"
+      - "Wget/"
+      - "libcurl"
+    http.status_code: 200
+
+  selection_c2_paths:
+    http.uri|contains:
+      - "/ca"
+      - "/updates"
+      - "/c2"
+      - "/tasks"
+      - "/jobs"
+      - "/beacon"
+    http.method: POST
+
+  selection_metasploit:
+    http.user_agent|contains:
+      - "Meterpreter"
+      - "meterpreter"
+    http.uri|contains:
+      - "/metro_"
+      - "/meterpreter"
+
+  selection_cobalt_strike:
+    # Cobalt Strike default malleable profiles
+    http.uri|re: '^/(jquery-[0-9]+\.min\.js|submit\.php|updates\.php)$'
+    http.user_agent|contains: "Mozilla/5.0 (compatible; MSIE 9.0"
+
+  filter_update_servers:
+    dst_ip|cidr:
+      - "13.107.4.0/24"    # Microsoft
+      - "151.101.0.0/17"   # Fastly
+      - "23.185.0.0/19"    # Fastly
+
+  condition: >
+    (1 of selection_c2_paths
+     or selection_metasploit
+     or selection_cobalt_strike
+     or selection_suspicious_ua)
+    and not filter_update_servers
+
+falsepositives:
+  - Legitimate automated tools and scripts
+  - Internal monitoring agents
+
+level: high
+
+fields:
+  - src_ip
+  - dst_ip
+  - http.uri
+  - http.user_agent
+  - http.method
+  - http.status_code

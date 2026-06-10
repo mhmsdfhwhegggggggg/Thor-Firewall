@@ -137,3 +137,23 @@ panic       = "abort"
 [profile.dev]
 opt-level = 1
 debug     = true
+
+# ── Kafka (rdkafka — real from github.com/fede1024/rust-rdkafka) ─────────────
+rdkafka = { version = "0.36", features = ["cmake-build", "ssl", "gssapi-vendored"] }
+
+# ── YARA (yara-sys — bindings to real VirusTotal/YARA C library) ─────────────
+yara = { version = "0.28", features = ["vendored"] }
+
+# ── Axum (replaces Actix-web for metrics/health — tokio ecosystem) ───────────
+axum = { version = "0.7", features = ["macros", "ws", "multipart"] }
+tower = { version = "0.4", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"] }
+
+# ── React Flow / D3 alternative — server-sent events for topology ─────────────
+tokio-stream = { version = "0.1", features = ["net", "io-util"] }
+async-stream  = "0.3"
+
+# ── Rustls (real TLS — github.com/rustls/rustls) ─────────────────────────────
+rustls          = "0.23"
+rustls-pemfile  = "2"
+tokio-rustls    = "0.26"

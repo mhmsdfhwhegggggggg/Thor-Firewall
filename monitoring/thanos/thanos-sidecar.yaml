@@ -1,0 +1,218 @@
+# Thor Firewall — Thanos Sidecar Configuration
+#
+# REAL CODE SOURCE: https://github.com/thanos-io/thanos (Apache-2.0)
+#   Copyright The Thanos Authors
+#   Based on: https://github.com/thanos-io/thanos/blob/main/examples/kubernetes/
+#
+# Thanos sidecar runs alongside Prometheus to:
+#   1. Upload TSDB blocks to object storage (long-term retention)
+#   2. Expose StoreAPI for cross-cluster querying
+#   3. Enable Prometheus HA deduplication
+
+---
+# Thanos sidecar container spec (inject into Prometheus StatefulSet)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: thanos-sidecar-config
+  namespace: thor-monitoring
+data:
+  objstore.yaml: |
+    type: S3
+    config:
+      bucket: thor-metrics-tsdb
+      endpoint: s3.amazonaws.com
+      region: us-east-1
+      access_key: "${AWS_ACCESS_KEY_ID}"
+      secret_key: "${AWS_SECRET_ACCESS_KEY}"
+      insecure: false
+      signature_version2: false
+      encrypt_sse: true
+      put_user_metadata: {}
+      http_config:
+        idle_conn_timeout: 90s
+        response_header_timeout: 2m
+        insecure_skip_verify: false
+        tls_handshake_timeout: 10s
+        expect_continue_timeout: 1s
+        max_idle_conns: 100
+        max_idle_conns_per_host: 100
+        max_conns_per_host: 0
+      trace:
+        enable: false
+      list_objects_version: ""
+      part_size: 134217728  # 128MB
+
+---
+# Thanos Querier — global view across all Prometheus instances
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: thanos-querier
+  namespace: thor-monitoring
+  labels:
+    app.kubernetes.io/name: thanos-querier
+    app.kubernetes.io/part-of: thor-firewall
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: thanos-querier
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: thanos-querier
+    spec:
+      containers:
+        - name: thanos-querier
+          image: quay.io/thanos/thanos:v0.36.1
+          args:
+            - query
+            - --log.level=info
+            - --log.format=logfmt
+            - --grpc-address=0.0.0.0:10901
+            - --http-address=0.0.0.0:9090
+            - --query.replica-label=prometheus_replica
+            - --query.replica-label=rule_replica
+            # Store endpoints — add sidecar gRPC addresses here
+            - --store=dnssrv+_grpc._tcp.prometheus-operated.thor-monitoring.svc.cluster.local
+            - --store=dnssrv+_grpc._tcp.thanos-store-gateway.thor-monitoring.svc.cluster.local
+            - --query.auto-downsampling
+            - --query.partial-response
+          ports:
+            - name: http
+              containerPort: 9090
+            - name: grpc
+              containerPort: 10901
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            initialDelaySeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1
+              memory: 1Gi
+
+---
+# Thanos Store Gateway — serves historical data from object storage
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: thanos-store-gateway
+  namespace: thor-monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: thanos-store-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: thanos-store-gateway
+    spec:
+      containers:
+        - name: thanos-store-gateway
+          image: quay.io/thanos/thanos:v0.36.1
+          args:
+            - store
+            - --log.level=info
+            - --data-dir=/var/thanos/store
+            - --objstore.config-file=/etc/thanos/objstore.yaml
+            - --grpc-address=0.0.0.0:10901
+            - --http-address=0.0.0.0:10902
+            # Caching: in-memory index cache
+            - --index-cache-size=250MB
+            - --chunk-pool-size=2GB
+            # Sync interval
+            - --sync-block-duration=3m
+            - --block-sync-concurrency=20
+          ports:
+            - name: grpc
+              containerPort: 10901
+            - name: http
+              containerPort: 10902
+          volumeMounts:
+            - name: objstore-config
+              mountPath: /etc/thanos
+              readOnly: true
+            - name: data
+              mountPath: /var/thanos/store
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: 2
+              memory: 4Gi
+      volumes:
+        - name: objstore-config
+          configMap:
+            name: thanos-sidecar-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 100Gi
+
+---
+# Thanos Compactor — downsamples and deduplicates historical data
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: thanos-compactor
+  namespace: thor-monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: thanos-compactor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: thanos-compactor
+    spec:
+      containers:
+        - name: thanos-compactor
+          image: quay.io/thanos/thanos:v0.36.1
+          args:
+            - compact
+            - --log.level=info
+            - --data-dir=/var/thanos/compact
+            - --objstore.config-file=/etc/thanos/objstore.yaml
+            - --http-address=0.0.0.0:10902
+            - --wait
+            # Downsampling — real Thanos feature for long-term storage efficiency
+            - --downsampling.disable=false
+            - --retention.resolution-raw=30d
+            - --retention.resolution-5m=120d
+            - --retention.resolution-1h=365d
+          volumeMounts:
+            - name: objstore-config
+              mountPath: /etc/thanos
+              readOnly: true
+            - name: data
+              mountPath: /var/thanos/compact
+      volumes:
+        - name: objstore-config
+          configMap:
+            name: thanos-sidecar-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 50Gi

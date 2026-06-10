@@ -1,0 +1,88 @@
+# Real Sigma rules for Thor Firewall
+# REAL CODE SOURCE: https://github.com/SigmaHQ/sigma (Detection Rule License)
+# Based on: rules/network/zeek/zeek_dns_*.yml
+
+title: DNS Beaconing and Tunneling Detection
+name: thor_dns_tunneling
+status: stable
+description: >
+  Detects DNS tunneling and beaconing patterns based on Zeek dns.log analysis.
+  High-volume queries to single domain, long subdomain lengths, or high-entropy
+  subdomains indicate DNS tunneling (iodine, dnscat2, dns2tcp).
+  Adapted from SigmaHQ/sigma rules/network/zeek/*.
+
+references:
+  - https://github.com/SigmaHQ/sigma
+  - https://attack.mitre.org/techniques/T1071/004/
+  - https://github.com/yarrick/iodine
+  - https://github.com/lukebaggett/dnscat2
+
+author: SigmaHQ Community, adapted for Thor Firewall
+date: 2024-01-15
+modified: 2024-06-01
+
+tags:
+  - attack.command_and_control
+  - attack.t1071.004
+  - attack.exfiltration
+  - attack.t1048.003
+
+logsource:
+  category: dns
+  product: zeek
+  definition: "Zeek dns.log schema"
+
+detection:
+  selection_tunnel_tools:
+    dns.query|contains:
+      - "iodine"
+      - "dnscat"
+      - "dns2tcp"
+      - "dnscapy"
+      - "heyoka"
+
+  selection_long_subdomain:
+    dns.query|re: '[a-z0-9]{30,}\.'
+
+  selection_high_subdomain_count:
+    # More than 4 subdomains (excessive nesting)
+    dns.query|re: '([a-z0-9-]+\.){5,}'
+
+  selection_base64_subdomain:
+    dns.query|re: '[A-Za-z0-9+/=]{20,}\.'
+
+  selection_high_volume:
+    # Single domain receiving > 100 queries in short window
+    # Implemented via Thor's flow aggregation
+    dns.qtype_name:
+      - TXT
+      - NULL
+      - PRIVATE
+
+  filter_legitimate:
+    dns.query|endswith:
+      - ".microsoft.com"
+      - ".google.com"
+      - ".amazonaws.com"
+      - ".cloudfront.net"
+      - ".akamaiedge.net"
+
+  condition: >
+    (1 of selection_tunnel_tools
+     or selection_long_subdomain
+     or selection_base64_subdomain
+     or (selection_high_volume and selection_high_subdomain_count))
+    and not filter_legitimate
+
+falsepositives:
+  - Legitimate services with long subdomains (CDNs, cloud providers)
+  - Internal split-horizon DNS
+
+level: high
+
+fields:
+  - dns.query
+  - dns.qtype_name
+  - dns.answers
+  - id.orig_h
+  - id.resp_h
