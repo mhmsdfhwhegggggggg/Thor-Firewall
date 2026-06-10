@@ -261,3 +261,109 @@ async def health():
 @app.get("/model/info")
 async def model_info():
     return {**_model_info, "classes": CLASS_NAMES, "input_dim": INPUT_DIM}
+
+
+# ── /v1/analyze/batch — alias expected by thor-agent rl_core.rs ──────────────
+
+class V1FlowFeatures(BaseModel):
+    """rl_core.rs sends: {flows: [[f32,...]], flow_ids: [str,...]}"""
+    pass
+
+class RLBatchRequest(BaseModel):
+    flows:    List[List[float]]
+    flow_ids: List[str]
+
+class RLFlowDecision(BaseModel):
+    flow_id:     Optional[str] = None
+    action:      int
+    action_name: str
+    confidence:  float
+    risk_score:  float
+    blocked:     bool
+    threat_type: Optional[str] = None
+
+class RLBatchResponse(BaseModel):
+    decisions:          List[RLFlowDecision]
+    batch_size:         int
+    inference_time_ms:  float
+    model_version:      str = "1.0.0"
+
+
+@app.post("/v1/analyze/batch", response_model=RLBatchResponse)
+async def v1_analyze_batch(body: RLBatchRequest):
+    """
+    Endpoint expected by thor-agent rl_core.rs.
+    Accepts flat feature vectors (not FlowFeatures objects).
+    """
+    if not body.flows:
+        return RLBatchResponse(decisions=[], batch_size=0, inference_time_ms=0.0)
+
+    t0 = time.perf_counter()
+
+    # Pad / trim to INPUT_DIM
+    features = []
+    for f in body.flows:
+        fl = list(f)
+        if len(fl) < INPUT_DIM:
+            fl += [0.0] * (INPUT_DIM - len(fl))
+        elif len(fl) > INPUT_DIM:
+            fl = fl[:INPUT_DIM]
+        features.append(fl)
+
+    X = np.array(features, dtype=np.float32)
+
+    if _model_type == "pytorch":
+        import torch
+        with torch.no_grad():
+            out   = _model(torch.from_numpy(X))
+            probs = out["probs"].numpy()
+            acts  = probs.argmax(axis=1).astype(np.int32)
+            risks = np.array([RISK_SCORES[a] * probs[i, a]
+                               for i, a in enumerate(acts)], dtype=np.float32)
+    elif _model_type == "onnx":
+        outputs = _onnx_session.run(None, {"features": X})
+        logits  = outputs[0]
+        probs   = np.exp(logits) / np.exp(logits).sum(axis=1, keepdims=True)
+        acts    = probs.argmax(axis=1).astype(np.int32)
+        risks   = np.array([RISK_SCORES[a] * probs[i, a]
+                             for i, a in enumerate(acts)], dtype=np.float32)
+    else:
+        acts, risks = _heuristic_predict(X)
+
+    latency_ms = (time.perf_counter() - t0) * 1000
+    INFERENCE_LATENCY.labels(mode=_model_type).observe(latency_ms / 1000)
+
+    THREAT_MAP = {
+        0: None, 1: "DoS", 2: "DDoS", 3: "PortScan",
+        4: "BruteForce", 5: "WebAttack", 6: "C2", 7: "Infiltration",
+    }
+    HIGH_RISK_THRESHOLD = 0.70
+
+    decisions = []
+    for i in range(len(body.flows)):
+        action    = int(acts[i])
+        risk      = float(risks[i])
+        is_threat = action != 0
+        decisions.append(RLFlowDecision(
+            flow_id     = body.flow_ids[i] if i < len(body.flow_ids) else str(i),
+            action      = action,
+            action_name = CLASS_NAMES[action],
+            confidence  = round(1.0 - risk if action == 0 else risk, 4),
+            risk_score  = round(risk, 4),
+            blocked     = is_threat and risk >= HIGH_RISK_THRESHOLD,
+            threat_type = THREAT_MAP.get(action),
+        ))
+        INFERENCE_TOTAL.labels(decision=CLASS_NAMES[action]).inc()
+
+    return RLBatchResponse(
+        decisions        = decisions,
+        batch_size       = len(decisions),
+        inference_time_ms= round(latency_ms, 3),
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8082"))
+    uvicorn.run("inference_server:app", host="0.0.0.0", port=port,
+                reload=False, workers=1, log_level="info")
