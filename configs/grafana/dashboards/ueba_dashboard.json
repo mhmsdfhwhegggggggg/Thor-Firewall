@@ -1,0 +1,13 @@
+{
+  "title": "Thor UEBA Dashboard",
+  "uid": "thor-ueba",
+  "version": 1,
+  "refresh": "30s",
+  "tags": ["thor", "ueba"],
+  "panels": [
+    {"id":1,"title":"Top Risk Users","type":"table","gridPos":{"x":0,"y":0,"w":12,"h":10},"targets":[{"expr":"topk(20, thor_ueba_entity_risk_score{entity_type='user'})","legendFormat":"{{entity_id}}"}]},
+    {"id":2,"title":"UEBA Alerts Over Time","type":"timeseries","gridPos":{"x":12,"y":0,"w":12,"h":10},"targets":[{"expr":"rate(thor_ueba_alerts_total[5m])*60","legendFormat":"Alerts/min"}]},
+    {"id":3,"title":"Anomaly Types Distribution","type":"piechart","gridPos":{"x":0,"y":10,"w":8,"h":8},"targets":[{"expr":"sum by (anomaly_type)(thor_ueba_events_total)","legendFormat":"{{anomaly_type}}"}]},
+    {"id":4,"title":"Peer Group Outliers","type":"stat","gridPos":{"x":8,"y":10,"w":4,"h":4},"targets":[{"expr":"thor_ueba_peer_outliers_total"}]}
+  ]
+}

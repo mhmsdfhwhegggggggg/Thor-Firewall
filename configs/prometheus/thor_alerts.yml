@@ -1,0 +1,95 @@
+# Thor Firewall — Prometheus Alerting Rules
+groups:
+  - name: thor_security
+    interval: 30s
+    rules:
+      - alert: ThorCriticalThreatRate
+        expr: rate(thor_threats_total{severity="critical"}[5m]) > 10
+        for: 2m
+        labels:
+          severity: critical
+          team: security
+        annotations:
+          summary: "Critical threat rate exceeding 10/min"
+          description: "Thor detected {{ $value | humanize }}/min critical threats"
+
+      - alert: ThorMLModelDrift
+        expr: thor_ml_drift_events_total > 0
+        for: 5m
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "ML model concept drift detected"
+          description: "ADWIN/DDM drift detector triggered — retraining may be needed"
+
+      - alert: ThorAgentDown
+        expr: up{job="thor-agent"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Thor agent {{ $labels.instance }} is down"
+
+      - alert: ThorHighFalsePositiveRate
+        expr: rate(thor_false_positives_total[1h]) / rate(thor_threats_total[1h]) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "False positive rate exceeding 5%"
+          description: "Current FP rate: {{ $value | humanizePercentage }}"
+
+      - alert: ThorUEBAHighRiskEntity
+        expr: thor_ueba_critical_entities > 5
+        for: 5m
+        labels:
+          severity: high
+        annotations:
+          summary: "Multiple high-risk UEBA entities detected"
+          description: "{{ $value }} entities with critical risk score"
+
+      - alert: ThorClickHouseDown
+        expr: up{job="thor-clickhouse"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ClickHouse database is unreachable"
+
+      - alert: ThorAPIHighLatency
+        expr: histogram_quantile(0.95, rate(thor_api_latency_seconds_bucket[5m])) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API P95 latency exceeds 2 seconds"
+
+      - alert: ThorComplianceFailure
+        expr: thor_compliance_score < 70
+        for: 1h
+        labels:
+          severity: warning
+          team: compliance
+        annotations:
+          summary: "Compliance score below 70%"
+          description: "Framework: {{ $labels.framework }}, Score: {{ $value }}%"
+
+  - name: thor_infrastructure
+    interval: 60s
+    rules:
+      - alert: ThorDiskPressure
+        expr: (node_filesystem_avail_bytes / node_filesystem_size_bytes) * 100 < 15
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk space below 15% on {{ $labels.instance }}"
+
+      - alert: ThorMemoryPressure
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Memory usage above 90% on {{ $labels.instance }}"

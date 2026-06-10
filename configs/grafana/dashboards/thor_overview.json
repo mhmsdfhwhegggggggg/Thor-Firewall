@@ -1,0 +1,15 @@
+{
+  "title": "Thor Firewall — Security Overview",
+  "uid": "thor-overview",
+  "version": 1,
+  "schemaVersion": 36,
+  "refresh": "10s",
+  "tags": ["thor", "security", "overview"],
+  "panels": [
+    {"id":1,"title":"Threats Last 24h","type":"stat","gridPos":{"x":0,"y":0,"w":4,"h":4},"targets":[{"expr":"increase(thor_threats_total[24h])","legendFormat":"Threats"}]},
+    {"id":2,"title":"Block Rate %","type":"gauge","gridPos":{"x":4,"y":0,"w":4,"h":4},"targets":[{"expr":"100 * rate(thor_threats_total{action='block'}[1h]) / rate(thor_threats_total[1h])"}],"fieldConfig":{"defaults":{"min":0,"max":100,"unit":"percent"}}},
+    {"id":3,"title":"ML Latency P95 (ms)","type":"stat","gridPos":{"x":8,"y":0,"w":4,"h":4},"targets":[{"expr":"histogram_quantile(0.95, rate(thor_api_latency_seconds_bucket[5m]))*1000"}]},
+    {"id":4,"title":"UEBA Critical Entities","type":"stat","gridPos":{"x":12,"y":0,"w":4,"h":4},"targets":[{"expr":"thor_ueba_critical_entities"}]},
+    {"id":5,"title":"Threat Rate Over Time","type":"timeseries","gridPos":{"x":0,"y":4,"w":24,"h":8},"targets":[{"expr":"rate(thor_threats_total[5m])*60","legendFormat":"Threats/min"},{"expr":"rate(thor_threats_total{severity='critical'}[5m])*60","legendFormat":"Critical/min"}]}
+  ]
+}

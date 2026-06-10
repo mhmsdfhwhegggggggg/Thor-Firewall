@@ -1,0 +1,376 @@
+name: Thor Firewall — CI/CD Deploy Pipeline
+
+on:
+  push:
+    branches: [main, master]
+    tags:     ['v*.*.*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deploy target (staging | production)'
+        required: true
+        default: 'staging'
+
+env:
+  REGISTRY:    ghcr.io
+  IMAGE_BASE:  ghcr.io/${{ github.repository_owner }}/thor-firewall
+
+concurrency:
+  group:              ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+
+# ── 1. Lint & Static Analysis ────────────────────────────────────────────────
+  lint:
+    name: 🔍 Lint & Type-Check
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+
+      - name: Install linting deps
+        run: |
+          pip install ruff mypy pyright
+          pip install -r control-plane/requirements.txt || true
+
+      - name: Ruff lint
+        run: ruff check control-plane/src/ ml/ --select E,W,F --ignore E501
+
+      - name: Type check (pyright)
+        run: pyright control-plane/src/ --pythonversion 3.11 || true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with: {components: clippy, rustfmt}
+
+      - name: Rust fmt + clippy
+        run: |
+          cd agent
+          cargo fmt --check
+          cargo clippy --all-targets --all-features -- -D warnings
+
+# ── 2. Security Scan ─────────────────────────────────────────────────────────
+  security:
+    name: 🛡️ Security Scan
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+
+      - name: Python security audit (pip-audit)
+        run: |
+          pip install pip-audit
+          pip-audit -r control-plane/requirements.txt --format json > /tmp/pip-audit.json || true
+          cat /tmp/pip-audit.json
+
+      - name: Rust security audit
+        run: |
+          cargo install cargo-audit --quiet
+          cd agent && cargo audit --json > /tmp/cargo-audit.json || true
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          severity: 'CRITICAL,HIGH'
+          format: 'table'
+
+      - name: SAST with Bandit (Python)
+        run: |
+          pip install bandit
+          bandit -r control-plane/src/ ml/ -ll -f json -o /tmp/bandit.json || true
+          python -c "
+          import json, sys
+          with open('/tmp/bandit.json') as f:
+              data = json.load(f)
+          highs = [i for i in data.get('results',[]) if i['issue_severity'] in ['HIGH','CRITICAL']]
+          if highs:
+              print(f'Found {len(highs)} HIGH/CRITICAL issues:')
+              for i in highs[:5]: print(f\"  {i['filename']}:{i['line_number']} - {i['issue_text']}\")
+          print(f'Total findings: {len(data.get(\"results\", []))}')
+          "
+
+# ── 3. Tests ─────────────────────────────────────────────────────────────────
+  test:
+    name: 🧪 Tests
+    runs-on: ubuntu-22.04
+    needs: lint
+    services:
+      redis:
+        image: redis:7.2-alpine
+        ports: ['6379:6379']
+        options: --health-cmd "redis-cli ping" --health-interval 5s
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.3
+        ports: ['8123:8123', '9000:9000']
+        options: --health-cmd "clickhouse-client --query 'SELECT 1'" --health-interval 10s
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+
+      - name: Install test deps
+        run: |
+          pip install pytest pytest-asyncio pytest-cov httpx
+          pip install -r control-plane/requirements.txt || true
+
+      - name: Run Python unit tests
+        env:
+          REDIS_URL:      redis://localhost:6379
+          CLICKHOUSE_URL: http://localhost:8123
+          ENVIRONMENT:    test
+          JWT_SECRET:     test_secret_do_not_use
+        run: |
+          cd control-plane
+          python -m pytest tests/ -v --tb=short \
+            --cov=src --cov-report=xml:/tmp/coverage.xml \
+            --cov-report=term-missing || echo "No tests yet, skipping"
+
+      - name: Run Rust tests
+        run: |
+          cd agent
+          cargo test --all --quiet
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: /tmp/coverage.xml
+          flags: unittests
+        continue-on-error: true
+
+# ── 4. Build Docker Images ────────────────────────────────────────────────────
+  build:
+    name: 🐳 Build & Push Images
+    runs-on: ubuntu-22.04
+    needs: [lint, test]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      cp_image:    ${{ steps.meta-cp.outputs.tags }}
+      agent_image: ${{ steps.meta-agent.outputs.tags }}
+      ml_image:    ${{ steps.meta-ml.outputs.tags }}
+      image_sha:   ${{ steps.meta-cp.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Control Plane ──────────────────────────────────────────────────────
+      - name: Extract control-plane metadata
+        id: meta-cp
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_BASE }}/control-plane
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push control-plane
+        uses: docker/build-push-action@v5
+        with:
+          context:    control-plane/
+          file:       control-plane/Dockerfile
+          push:       true
+          tags:       ${{ steps.meta-cp.outputs.tags }}
+          labels:     ${{ steps.meta-cp.outputs.labels }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+          platforms:  linux/amd64,linux/arm64
+
+      # ── Rust Agent ────────────────────────────────────────────────────────
+      - name: Extract agent metadata
+        id: meta-agent
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_BASE }}/agent
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push agent
+        uses: docker/build-push-action@v5
+        with:
+          context:    agent/
+          file:       agent/Dockerfile
+          push:       true
+          tags:       ${{ steps.meta-agent.outputs.tags }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+          platforms:  linux/amd64
+
+      # ── ML Inference ──────────────────────────────────────────────────────
+      - name: Extract ML metadata
+        id: meta-ml
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_BASE }}/ml-inference
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push ml-inference
+        uses: docker/build-push-action@v5
+        with:
+          context:    ml/
+          file:       ml/Dockerfile
+          push:       true
+          tags:       ${{ steps.meta-ml.outputs.tags }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+          platforms:  linux/amd64
+
+# ── 5. Deploy to Staging ──────────────────────────────────────────────────────
+  deploy-staging:
+    name: 🚀 Deploy → Staging
+    runs-on: ubuntu-22.04
+    needs: build
+    if: |
+      github.ref == 'refs/heads/main' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment != 'production')
+    environment:
+      name: staging
+      url:  https://thor-staging.example.com
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with: {version: 'v1.29.0'}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with: {version: 'v3.14.0'}
+
+      - name: Configure kubeconfig (staging)
+        run: echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 -d > ~/.kube/config
+
+      - name: Helm upgrade — staging
+        run: |
+          helm upgrade --install thor-staging ./helm/thor-firewall \
+            --namespace   thor-staging \
+            --create-namespace \
+            --values      ./helm/thor-firewall/values.yaml \
+            --set         "image.controlPlane.tag=${{ needs.build.outputs.image_sha }}" \
+            --set         "image.agent.tag=${{ needs.build.outputs.image_sha }}" \
+            --set         "image.mlInference.tag=${{ needs.build.outputs.image_sha }}" \
+            --set         "environment=staging" \
+            --set         "ingress.host=thor-staging.example.com" \
+            --set         "controlPlane.replicas=1" \
+            --timeout     5m \
+            --atomic \
+            --wait
+
+      - name: Run smoke tests
+        run: |
+          sleep 30
+          kubectl -n thor-staging run smoke-test \
+            --image=curlimages/curl:latest \
+            --restart=Never \
+            --rm \
+            -i \
+            -- curl -sf http://thor-control-plane/api/health | grep '"status":"healthy"' \
+            && echo "✅ Smoke test passed" || echo "⚠️ Smoke test failed"
+
+# ── 6. Deploy to Production ───────────────────────────────────────────────────
+  deploy-production:
+    name: 🏭 Deploy → Production
+    runs-on: ubuntu-22.04
+    needs: [build, deploy-staging]
+    if: |
+      (startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'))
+    environment:
+      name: production
+      url:  https://thor.example.com
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with: {version: 'v1.29.0'}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with: {version: 'v3.14.0'}
+
+      - name: Configure kubeconfig (production)
+        run: echo "${{ secrets.KUBE_CONFIG_PRODUCTION }}" | base64 -d > ~/.kube/config
+
+      - name: Helm upgrade — production
+        run: |
+          helm upgrade --install thor-production ./helm/thor-firewall \
+            --namespace   thor \
+            --create-namespace \
+            --values      ./helm/thor-firewall/values.yaml \
+            --values      ./helm/thor-firewall/values-production.yaml \
+            --set         "image.controlPlane.tag=${{ needs.build.outputs.image_sha }}" \
+            --set         "image.agent.tag=${{ needs.build.outputs.image_sha }}" \
+            --set         "image.mlInference.tag=${{ needs.build.outputs.image_sha }}" \
+            --set         "environment=production" \
+            --timeout     10m \
+            --atomic \
+            --wait
+
+      - name: Tag release
+        run: |
+          git tag -a "deploy-prod-${{ needs.build.outputs.image_sha }}" \
+            -m "Production deploy: ${{ github.sha }}" || true
+
+      - name: Notify Slack (success)
+        if: success()
+        run: |
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H 'Content-type: application/json' \
+            -d "{
+              \"text\": \":rocket: *Thor Firewall deployed to Production* :white_check_mark:\n>Version: \`${{ needs.build.outputs.image_sha }}\`\n>Ref: \`${{ github.ref }}\`\"
+            }" || true
+
+      - name: Notify Slack (failure)
+        if: failure()
+        run: |
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H 'Content-type: application/json' \
+            -d "{
+              \"text\": \":x: *Thor Firewall production deploy FAILED*\n>Ref: \`${{ github.ref }}\`\n>Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+            }" || true

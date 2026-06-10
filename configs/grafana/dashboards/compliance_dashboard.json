@@ -1,0 +1,13 @@
+{
+  "title": "Thor Compliance Dashboard",
+  "uid": "thor-compliance",
+  "version": 1,
+  "refresh": "1m",
+  "tags": ["thor", "compliance", "soc2", "iso27001"],
+  "panels": [
+    {"id":1,"title":"SOC2 Score","type":"gauge","gridPos":{"x":0,"y":0,"w":6,"h":6},"targets":[{"expr":"thor_compliance_score{framework='soc2'}"}],"fieldConfig":{"defaults":{"min":0,"max":100,"unit":"percent","thresholds":{"steps":[{"color":"red"},{"color":"yellow","value":70},{"color":"green","value":85}]}}}},
+    {"id":2,"title":"ISO 27001 Score","type":"gauge","gridPos":{"x":6,"y":0,"w":6,"h":6},"targets":[{"expr":"thor_compliance_score{framework='iso27001'}"}],"fieldConfig":{"defaults":{"min":0,"max":100,"unit":"percent"}}},
+    {"id":3,"title":"NCA-ECC Score","type":"gauge","gridPos":{"x":12,"y":0,"w":6,"h":6},"targets":[{"expr":"thor_compliance_score{framework='nca_ecc'}"}],"fieldConfig":{"defaults":{"min":0,"max":100,"unit":"percent"}}},
+    {"id":4,"title":"Failed Controls Timeline","type":"timeseries","gridPos":{"x":0,"y":6,"w":24,"h":8},"targets":[{"expr":"thor_compliance_failed_controls","legendFormat":"{{framework}}"}]}
+  ]
+}
