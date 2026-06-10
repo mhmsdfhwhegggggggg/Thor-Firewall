@@ -1,359 +1,385 @@
-// Thor Firewall Dashboard — Main Dashboard Page
-import React, { useCallback, useEffect, useState } from "react";
-import { Shield, Wifi, Brain, Settings, Terminal, Bell, Moon, Sun } from "lucide-react";
+/**
+ * Thor Firewall — Main Dashboard Page
+ * Real-time threat monitoring with live metrics.
+ */
+import React, { useEffect, useState, useCallback } from "react";
+import {
+  LineChart, Line, BarChart, Bar, PieChart, Pie, Cell,
+  XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
+  AreaChart, Area,
+} from "recharts";
 
-import { RealTimeStats } from "../components/dashboard/RealTimeStats";
-import { ThreatFeed } from "../components/threats/ThreatFeed";
-import { ThroughputChart } from "../components/charts/ThroughputChart";
-import { FlowTable } from "../components/flows/FlowTable";
-import { useNetworkStats, useThreats, useFlows, useSecurityQuery } from "../hooks/useApi";
-import { useWebSocket } from "../hooks/useWebSocket";
-import type { WebSocketMessage, ThreatEvent, NetworkStats, SystemStats, MLStats, FlowRecord } from "../types";
-
-// ============================================================================
-// Demo / Mock data (used when API not available)
-// ============================================================================
-
-const MOCK_NETWORK: NetworkStats = {
-  totalPackets: 92_847_123,
-  totalBytes: 1_234_567_890,
-  packetsPerSecond: 847_293,
-  bitsPerSecond: 9_876_543_210,
-  activeFlows: 142_847,
-  blockedFlows: 3_847,
-  suspiciousFlows: 284,
-  throughputMbps: 9876.5,
-  tableUtilization: 0.67,
-};
-
-const MOCK_SYSTEM: SystemStats = {
-  agentCpuPct: 4.2,
-  agentMemoryMb: 512,
-  ebpfMapUtilization: 0.67,
-  rlInferenceLatencyUs: 87,
-  llmQueriesPerMin: 23,
-  uptime: 86_400,
-};
-
-const MOCK_ML: MLStats = {
-  totalAnalyzed: 92_847_123,
-  totalBlocked: 3_847,
-  totalAllowed: 92_843_276,
-  avgLatencyUs: 87,
-  falsePositives: 12,
-  falseNegatives: 3,
-  currentAccuracy: 0.9983,
-};
-
-function generateMockFlow(i: number): FlowRecord {
-  const states: Array<FlowRecord["state"]> = ["allowed", "allowed", "allowed", "suspicious", "blocked"];
-  const protos: Array<FlowRecord["key"]["protocol"]> = ["tcp", "tcp", "udp", "tcp", "icmp"];
-  const state = states[i % states.length];
-  return {
-    flowId: `flow-${i}`,
-    key: {
-      srcIp: `192.168.${Math.floor(i / 256) % 256}.${i % 256}`,
-      dstIp: `10.0.${(i * 3) % 256}.${(i * 7) % 256}`,
-      srcPort: 32768 + (i % 32767),
-      dstPort: [80, 443, 22, 53, 8080][i % 5],
-      protocol: protos[i % protos.length],
-    },
-    stats: {
-      packets: 1000 + i * 17,
-      bytes: 100_000 + i * 1337,
-      pps: 50 + (i % 500),
-      bps: 400_000 + i * 10_000,
-      firstSeen: Date.now() - 60_000,
-      lastSeen: Date.now(),
-      avgPacketSize: 800 + (i % 700),
-      payloadEntropy: state === "blocked" ? 7.8 + Math.random() * 0.2 : 3 + Math.random() * 4,
-      retransmissions: i % 10,
-    },
-    state,
-    decision: state === "blocked" ? "block" : state === "suspicious" ? "mirror" : "allow",
-    riskScore: state === "blocked" ? 0.8 + Math.random() * 0.2 : state === "suspicious" ? 0.4 + Math.random() * 0.3 : Math.random() * 0.3,
-    confidence: 0.8 + Math.random() * 0.2,
-    tags: state === "blocked" ? ["syn-flood", "anomaly"] : [],
-    agentId: `marl-tcp-agent`,
-  };
+// Types
+interface ThreatSummary {
+  total_threats: number;
+  blocked: number;
+  allowed: number;
+  by_type: Record<string, number>;
+  by_severity: Record<string, number>;
+  top_attackers: Array<{ ip: string; count: number }>;
+  time_series: Array<{ timestamp: number; total: number; blocked: number; by_type: Record<string, number> }>;
 }
 
-const MOCK_FLOWS: FlowRecord[] = Array.from({ length: 100 }, (_, i) => generateMockFlow(i));
+interface HealthComponent {
+  status: "ok" | "degraded" | "down";
+  latency_ms?: number;
+  detail?: string;
+}
 
-const MOCK_THREATS: ThreatEvent[] = [
-  {
-    eventId: "t1",
-    timestamp: Date.now() - 5000,
-    flow: { srcIp: "103.45.67.89", dstIp: "10.0.0.5", srcPort: 54321, dstPort: 22, protocol: "tcp" },
-    threatType: "ssh-brute-force",
-    severity: "critical",
-    riskScore: 0.97,
-    confidence: 0.95,
-    explanation: "SSH brute force: 2847 attempts in 30s. Pattern matches known botnet fingerprint.",
-    blocked: true,
-    agentId: "marl-tcp-agent",
-    mitreTechnique: "T1110.001",
-  },
-  {
-    eventId: "t2",
-    timestamp: Date.now() - 15000,
-    flow: { srcIp: "185.220.101.23", dstIp: "10.0.0.1", srcPort: 45000, dstPort: 80, protocol: "tcp" },
-    threatType: "syn-flood",
-    severity: "high",
-    riskScore: 0.89,
-    confidence: 0.92,
-    explanation: "SYN flood: 184,293 packets/s from TOR exit node. Applied SYN cookie mitigation.",
-    blocked: true,
-    agentId: "marl-tcp-agent",
-    mitreTechnique: "T1498.001",
-  },
-  {
-    eventId: "t3",
-    timestamp: Date.now() - 45000,
-    flow: { srcIp: "192.168.1.45", dstIp: "8.8.8.8", srcPort: 54000, dstPort: 53, protocol: "udp" },
-    threatType: "dns-tunnel",
-    severity: "medium",
-    riskScore: 0.72,
-    confidence: 0.78,
-    explanation: "DNS tunneling detected: entropy=7.91, unusually long subdomain labels, CICIDS pattern match.",
-    blocked: false,
-    agentId: "marl-udp-agent",
-    mitreTechnique: "T1071.004",
-  },
+interface SystemHealth {
+  status: string;
+  components: Record<string, HealthComponent>;
+  timestamp: number;
+}
+
+// Constants
+const SEVERITY_COLORS: Record<string, string> = {
+  critical: "#ef4444",
+  high:     "#f97316",
+  medium:   "#eab308",
+  low:      "#22c55e",
+};
+
+const TYPE_COLORS = [
+  "#3b82f6", "#8b5cf6", "#ef4444", "#f97316",
+  "#22c55e", "#06b6d4", "#ec4899", "#84cc16",
 ];
 
-// ============================================================================
-// Navigation
-// ============================================================================
+const API_BASE = import.meta.env.BASE_URL?.replace(/\/$/, "") ?? "";
 
-type Tab = "overview" | "flows" | "threats" | "rules" | "query" | "settings";
+// Hooks
+function useThreatSummary(windowHours = 24) {
+  const [data, setData] = useState<ThreatSummary | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
-const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
-  { id: "overview",  label: "Overview",  icon: <Shield className="h-4 w-4" /> },
-  { id: "flows",     label: "Flows",     icon: <Wifi className="h-4 w-4" /> },
-  { id: "threats",   label: "Threats",   icon: <Bell className="h-4 w-4" /> },
-  { id: "query",     label: "AI Query",  icon: <Brain className="h-4 w-4" /> },
-  { id: "settings",  label: "Settings",  icon: <Settings className="h-4 w-4" /> },
-];
+  const fetch_ = useCallback(async () => {
+    try {
+      const r = await fetch(`${API_BASE}/api/threats/summary?window_hours=${windowHours}`, {
+        headers: { "Authorization": `Bearer ${localStorage.getItem("thor_token") ?? ""}` },
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      setData(await r.json());
+      setError(null);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [windowHours]);
 
-// ============================================================================
-// AI Query Panel
-// ============================================================================
+  useEffect(() => {
+    fetch_();
+    const id = setInterval(fetch_, 15_000);
+    return () => clearInterval(id);
+  }, [fetch_]);
 
-function AIQueryPanel() {
-  const { ask, loading, answer } = useSecurityQuery();
-  const [question, setQuestion] = useState("");
+  return { data, loading, error, refetch: fetch_ };
+}
 
-  const presets = [
-    "What are the top 5 threat actors in the last hour?",
-    "Show suspicious flows with entropy > 7.5",
-    "Explain the current SYN flood mitigation status",
-    "Which IPs should be added to the blocklist?",
-  ];
+function useSystemHealth() {
+  const [data, setData] = useState<SystemHealth | null>(null);
 
+  useEffect(() => {
+    const fetch_ = async () => {
+      try {
+        const r = await fetch(`${API_BASE}/health`);
+        if (r.ok) setData(await r.json());
+      } catch {}
+    };
+    fetch_();
+    const id = setInterval(fetch_, 10_000);
+    return () => clearInterval(id);
+  }, []);
+
+  return data;
+}
+
+// ── Sub-components ─────────────────────────────────────────────────────────────
+
+function MetricCard({
+  title, value, sub, color = "#3b82f6", icon,
+}: {
+  title: string; value: string | number; sub?: string;
+  color?: string; icon?: string;
+}) {
   return (
-    <div className="flex h-full flex-col gap-4 p-4">
-      <div>
-        <h2 className="text-lg font-semibold text-white">AI Security Assistant</h2>
-        <p className="text-sm text-white/50">Powered by Mistral-7B + RAG (MISP / CVE / OTX)</p>
-      </div>
-
-      {/* Preset questions */}
-      <div className="flex flex-wrap gap-2">
-        {presets.map((p) => (
-          <button
-            key={p}
-            onClick={() => setQuestion(p)}
-            className="rounded-full border border-cyan-800/50 bg-cyan-900/20 px-3 py-1 text-xs text-cyan-400 hover:bg-cyan-800/30"
-          >
-            {p}
-          </button>
-        ))}
-      </div>
-
-      {/* Input */}
-      <div className="flex gap-2">
-        <div className="relative flex-1">
-          <Terminal className="absolute left-3 top-3 h-4 w-4 text-white/30" />
-          <textarea
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && question.trim()) { e.preventDefault(); ask(question); } }}
-            placeholder="Ask anything about network security..."
-            rows={3}
-            className="w-full rounded-xl border border-white/10 bg-white/5 py-3 pl-10 pr-4 text-sm text-white placeholder-white/30 focus:border-cyan-500 focus:outline-none resize-none"
-          />
-        </div>
-        <button
-          onClick={() => question.trim() && ask(question)}
-          disabled={loading || !question.trim()}
-          className="self-end rounded-xl bg-cyan-600 px-4 py-3 text-sm font-semibold text-white hover:bg-cyan-500 disabled:opacity-50"
-        >
-          {loading ? "…" : "Ask"}
-        </button>
-      </div>
-
-      {/* Answer */}
-      {answer && (
-        <div className="flex-1 rounded-xl border border-cyan-900/50 bg-cyan-950/30 p-4 text-sm text-white/80 whitespace-pre-wrap overflow-auto">
-          {answer}
-        </div>
-      )}
+    <div style={{
+      background: "#1e293b", borderRadius: 12, padding: "20px 24px",
+      borderLeft: `4px solid ${color}`, minWidth: 160,
+    }}>
+      {icon && <div style={{ fontSize: 28, marginBottom: 8 }}>{icon}</div>}
+      <div style={{ color: "#94a3b8", fontSize: 13, marginBottom: 4 }}>{title}</div>
+      <div style={{ color: "#f1f5f9", fontSize: 28, fontWeight: 700 }}>{value}</div>
+      {sub && <div style={{ color: "#64748b", fontSize: 12, marginTop: 4 }}>{sub}</div>}
     </div>
   );
 }
 
-// ============================================================================
-// Dashboard Page
-// ============================================================================
+function StatusDot({ status }: { status: string }) {
+  const color = status === "ok" ? "#22c55e" : status === "degraded" ? "#eab308" : "#ef4444";
+  return (
+    <span style={{
+      display: "inline-block", width: 10, height: 10,
+      borderRadius: "50%", background: color,
+      boxShadow: `0 0 6px ${color}`,
+    }} />
+  );
+}
 
-export function DashboardPage() {
-  const [tab, setTab] = useState<Tab>("overview");
-  const [dark, setDark] = useState(true);
-  const [wsEvents, setWsEvents] = useState<ThreatEvent[]>([...MOCK_THREATS]);
+function HealthPanel({ health }: { health: SystemHealth | null }) {
+  if (!health) return null;
+  const components = Object.entries(health.components ?? {});
+  return (
+    <div style={{ background: "#1e293b", borderRadius: 12, padding: 20 }}>
+      <div style={{ color: "#94a3b8", fontSize: 13, marginBottom: 12, fontWeight: 600 }}>
+        SYSTEM STATUS
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: 10 }}>
+        {components.map(([name, comp]) => (
+          <div key={name} style={{
+            background: "#0f172a", borderRadius: 8, padding: "10px 14px",
+            display: "flex", alignItems: "center", gap: 10,
+          }}>
+            <StatusDot status={comp.status} />
+            <div>
+              <div style={{ color: "#e2e8f0", fontSize: 13, fontWeight: 500 }}>
+                {name.replace(/_/g, " ")}
+              </div>
+              {comp.latency_ms != null && (
+                <div style={{ color: "#64748b", fontSize: 11 }}>
+                  {comp.latency_ms.toFixed(1)}ms
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
-  // API data (falls back to mocks when unavailable)
-  const { data: networkData } = useNetworkStats(1000);
-  const { data: threatData } = useThreats(100);
-  const { data: flowData, loading: flowLoading } = useFlows();
-
-  const network = networkData ?? MOCK_NETWORK;
-  const threats = (threatData ?? []).length > 0 ? (threatData ?? []) : wsEvents;
-  const flows   = flowData?.flows ?? MOCK_FLOWS;
-
-  // WebSocket live updates
-  const wsUrl = `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/ws/live`;
-  const { isConnected } = useWebSocket({
-    url: wsUrl,
-    onMessage: useCallback((msg: WebSocketMessage) => {
-      if (msg.type === "threat_detected") {
-        setWsEvents((prev) => [msg.data as ThreatEvent, ...prev].slice(0, 200));
-      }
-    }, []),
-  });
+// ── Time-series chart ─────────────────────────────────────────────────────────
+function ThreatTimelineChart({ timeSeries }: {
+  timeSeries: ThreatSummary["time_series"];
+}) {
+  const data = timeSeries.map(b => ({
+    time:    new Date(b.timestamp * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    total:   b.total,
+    blocked: b.blocked,
+    allowed: b.total - b.blocked,
+  }));
 
   return (
-    <div className="flex h-screen flex-col bg-gray-950 text-white overflow-hidden">
-      {/* ===== Header ===== */}
-      <header className="flex shrink-0 items-center gap-4 border-b border-white/10 px-6 py-3">
-        <div className="flex items-center gap-2">
-          <Shield className="h-7 w-7 text-cyan-400" />
-          <div>
-            <h1 className="text-base font-bold tracking-tight">Thor Firewall</h1>
-            <p className="text-xs text-white/40">Next-Generation AI Security Platform</p>
-          </div>
-        </div>
+    <div style={{ background: "#1e293b", borderRadius: 12, padding: 20 }}>
+      <div style={{ color: "#94a3b8", fontSize: 13, marginBottom: 16, fontWeight: 600 }}>
+        THREAT TIMELINE (HOURLY)
+      </div>
+      <ResponsiveContainer width="100%" height={220}>
+        <AreaChart data={data} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
+          <defs>
+            <linearGradient id="gradBlocked" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%"  stopColor="#ef4444" stopOpacity={0.3} />
+              <stop offset="95%" stopColor="#ef4444" stopOpacity={0} />
+            </linearGradient>
+            <linearGradient id="gradAllowed" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%"  stopColor="#22c55e" stopOpacity={0.2} />
+              <stop offset="95%" stopColor="#22c55e" stopOpacity={0} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+          <XAxis dataKey="time" stroke="#475569" tick={{ fill: "#64748b", fontSize: 11 }} />
+          <YAxis stroke="#475569" tick={{ fill: "#64748b", fontSize: 11 }} />
+          <Tooltip
+            contentStyle={{ background: "#0f172a", border: "1px solid #334155", borderRadius: 8 }}
+            labelStyle={{ color: "#e2e8f0" }}
+          />
+          <Legend wrapperStyle={{ color: "#94a3b8", fontSize: 12 }} />
+          <Area type="monotone" dataKey="blocked" stroke="#ef4444" fill="url(#gradBlocked)" name="Blocked" />
+          <Area type="monotone" dataKey="allowed" stroke="#22c55e" fill="url(#gradAllowed)" name="Allowed" />
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
 
-        {/* Nav */}
-        <nav className="ml-8 flex gap-1">
-          {TABS.map((t) => (
-            <button
-              key={t.id}
-              onClick={() => setTab(t.id)}
-              className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm transition-all ${
-                tab === t.id
-                  ? "bg-cyan-600/20 text-cyan-400"
-                  : "text-white/50 hover:bg-white/5 hover:text-white/80"
-              }`}
-            >
-              {t.icon}
-              {t.label}
-            </button>
-          ))}
-        </nav>
+// ── Threat type breakdown ─────────────────────────────────────────────────────
+function ThreatTypeChart({ byType }: { byType: Record<string, number> }) {
+  const data = Object.entries(byType)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([name, value]) => ({ name, value }));
 
-        <div className="ml-auto flex items-center gap-3 text-xs text-white/40">
-          <span
-            className={`flex items-center gap-1.5 ${isConnected ? "text-green-400" : "text-red-400"}`}
-          >
-            <span className={`h-1.5 w-1.5 rounded-full ${isConnected ? "bg-green-400 animate-pulse" : "bg-red-400"}`} />
-            {isConnected ? "Live" : "Disconnected"}
-          </span>
-          <span>v0.1.0</span>
-        </div>
-      </header>
+  return (
+    <div style={{ background: "#1e293b", borderRadius: 12, padding: 20 }}>
+      <div style={{ color: "#94a3b8", fontSize: 13, marginBottom: 16, fontWeight: 600 }}>
+        THREATS BY TYPE
+      </div>
+      <ResponsiveContainer width="100%" height={220}>
+        <BarChart data={data} margin={{ top: 5, right: 10, left: 0, bottom: 30 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+          <XAxis dataKey="name" stroke="#475569" tick={{ fill: "#64748b", fontSize: 11 }}
+                 angle={-30} textAnchor="end" />
+          <YAxis stroke="#475569" tick={{ fill: "#64748b", fontSize: 11 }} />
+          <Tooltip
+            contentStyle={{ background: "#0f172a", border: "1px solid #334155", borderRadius: 8 }}
+            labelStyle={{ color: "#e2e8f0" }}
+          />
+          <Bar dataKey="value" name="Count" radius={[4, 4, 0, 0]}>
+            {data.map((_, i) => (
+              <Cell key={i} fill={TYPE_COLORS[i % TYPE_COLORS.length]} />
+            ))}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
 
-      {/* ===== Content ===== */}
-      <main className="flex-1 overflow-hidden">
-        {/* Overview */}
-        {tab === "overview" && (
-          <div className="flex h-full flex-col gap-4 overflow-auto p-6">
-            <RealTimeStats
-              network={network}
-              system={MOCK_SYSTEM}
-              ml={MOCK_ML}
-            />
+// ── Severity pie ──────────────────────────────────────────────────────────────
+function SeverityPie({ bySeverity }: { bySeverity: Record<string, number> }) {
+  const data = Object.entries(bySeverity).map(([name, value]) => ({ name, value }));
+  return (
+    <div style={{ background: "#1e293b", borderRadius: 12, padding: 20 }}>
+      <div style={{ color: "#94a3b8", fontSize: 13, marginBottom: 8, fontWeight: 600 }}>
+        SEVERITY BREAKDOWN
+      </div>
+      <ResponsiveContainer width="100%" height={200}>
+        <PieChart>
+          <Pie data={data} cx="50%" cy="50%" outerRadius={75} dataKey="value" nameKey="name">
+            {data.map((entry, i) => (
+              <Cell key={i} fill={SEVERITY_COLORS[entry.name] ?? "#64748b"} />
+            ))}
+          </Pie>
+          <Tooltip
+            contentStyle={{ background: "#0f172a", border: "1px solid #334155", borderRadius: 8 }}
+          />
+          <Legend wrapperStyle={{ color: "#94a3b8", fontSize: 12 }} />
+        </PieChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
 
-            <div className="grid flex-1 grid-cols-5 gap-4" style={{ minHeight: 0 }}>
-              {/* Throughput chart */}
-              <div className="col-span-3 rounded-xl border border-white/10 bg-gray-900/60 p-4">
-                <h3 className="mb-3 text-sm font-semibold text-white/70">Network Throughput</h3>
-                <div className="h-48">
-                  <ThroughputChart
-                    currentMbps={network.throughputMbps}
-                    blockedPps={network.blockedFlows / 60}
-                    suspiciousPps={network.suspiciousFlows / 60}
-                  />
+// ── Top Attackers ─────────────────────────────────────────────────────────────
+function TopAttackers({ attackers }: { attackers: Array<{ ip: string; count: number }> }) {
+  return (
+    <div style={{ background: "#1e293b", borderRadius: 12, padding: 20 }}>
+      <div style={{ color: "#94a3b8", fontSize: 13, marginBottom: 12, fontWeight: 600 }}>
+        TOP ATTACKERS
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {attackers.slice(0, 8).map((a, i) => {
+          const max = attackers[0]?.count ?? 1;
+          const pct = (a.count / max) * 100;
+          return (
+            <div key={a.ip} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ color: "#64748b", fontSize: 11, width: 18, textAlign: "right" }}>
+                #{i + 1}
+              </span>
+              <div style={{ flex: 1 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+                  <span style={{ color: "#e2e8f0", fontSize: 13, fontFamily: "monospace" }}>{a.ip}</span>
+                  <span style={{ color: "#ef4444", fontSize: 12, fontWeight: 600 }}>{a.count}</span>
+                </div>
+                <div style={{ height: 4, background: "#0f172a", borderRadius: 2 }}>
+                  <div style={{
+                    height: "100%", width: `${pct}%`,
+                    background: `linear-gradient(to right, #ef4444, #f97316)`,
+                    borderRadius: 2, transition: "width 0.3s",
+                  }} />
                 </div>
               </div>
-
-              {/* Threat feed */}
-              <div className="col-span-2 overflow-hidden rounded-xl border border-white/10 bg-gray-900/60 p-4">
-                <ThreatFeed events={threats} maxHeight="240px" />
-              </div>
             </div>
-
-            {/* Flow table */}
-            <div className="h-72 rounded-xl border border-white/10 bg-gray-900/60 p-4">
-              <h3 className="mb-3 text-sm font-semibold text-white/70">Top Flows</h3>
-              <div className="h-52">
-                <FlowTable
-                  flows={flows.slice(0, 20)}
-                  loading={flowLoading}
-                />
-              </div>
-            </div>
+          );
+        })}
+        {attackers.length === 0 && (
+          <div style={{ color: "#475569", fontSize: 13, textAlign: "center", padding: "20px 0" }}>
+            No attackers detected
           </div>
         )}
+      </div>
+    </div>
+  );
+}
 
-        {/* Flows tab */}
-        {tab === "flows" && (
-          <div className="flex h-full flex-col p-6 gap-4">
-            <h2 className="text-lg font-semibold text-white">Flow Monitor</h2>
-            <div className="flex-1 overflow-hidden rounded-xl border border-white/10 bg-gray-900/60 p-4">
-              <FlowTable
-                flows={flows}
-                loading={flowLoading}
-              />
-            </div>
-          </div>
-        )}
+// ── Main Dashboard ─────────────────────────────────────────────────────────────
+export default function DashboardPage() {
+  const [windowHours, setWindowHours] = useState(24);
+  const { data, loading, error } = useThreatSummary(windowHours);
+  const health = useSystemHealth();
 
-        {/* Threats tab */}
-        {tab === "threats" && (
-          <div className="flex h-full flex-col p-6 gap-4">
-            <h2 className="text-lg font-semibold text-white">Threat Intelligence</h2>
-            <div className="flex-1 overflow-hidden rounded-xl border border-white/10 bg-gray-900/60 p-4">
-              <ThreatFeed events={threats} maxHeight="100%" />
-            </div>
-          </div>
-        )}
+  const blockRate = data
+    ? data.total_threats > 0 ? ((data.blocked / data.total_threats) * 100).toFixed(1) : "100.0"
+    : "—";
 
-        {/* AI Query tab */}
-        {tab === "query" && (
-          <div className="h-full rounded-none">
-            <AIQueryPanel />
+  return (
+    <div style={{
+      background: "#0f172a", minHeight: "100vh", padding: "24px",
+      color: "#e2e8f0", fontFamily: "'Inter', 'Segoe UI', sans-serif",
+    }}>
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
+        <div>
+          <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700, color: "#f1f5f9" }}>
+            ⚡ Thor Firewall Dashboard
+          </h1>
+          <div style={{ color: "#475569", fontSize: 13, marginTop: 4 }}>
+            Enterprise Next-Generation Firewall — Real-time Monitoring
           </div>
-        )}
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <span style={{ color: "#64748b", fontSize: 12 }}>Window:</span>
+          {[1, 6, 24, 72].map(h => (
+            <button key={h}
+              onClick={() => setWindowHours(h)}
+              style={{
+                padding: "6px 14px", borderRadius: 6, border: "1px solid",
+                borderColor: windowHours === h ? "#3b82f6" : "#334155",
+                background:  windowHours === h ? "#1d4ed8" : "#1e293b",
+                color:       windowHours === h ? "#fff" : "#94a3b8",
+                cursor: "pointer", fontSize: 12,
+              }}
+            >{h}h</button>
+          ))}
+        </div>
+      </div>
 
-        {/* Settings */}
-        {tab === "settings" && (
-          <div className="p-6 text-white/50">
-            <h2 className="mb-4 text-lg font-semibold text-white">Settings</h2>
-            <p>Configuration panel — coming soon.</p>
-          </div>
-        )}
-      </main>
+      {/* Error banner */}
+      {error && (
+        <div style={{
+          background: "#450a0a", border: "1px solid #991b1b", borderRadius: 8,
+          padding: "10px 16px", marginBottom: 16, color: "#fca5a5", fontSize: 13,
+        }}>
+          ⚠ API Error: {error}
+        </div>
+      )}
+
+      {/* System health */}
+      <div style={{ marginBottom: 20 }}>
+        <HealthPanel health={health} />
+      </div>
+
+      {/* KPI cards */}
+      <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 20 }}>
+        <MetricCard title="Total Threats"  value={loading ? "…" : (data?.total_threats ?? 0).toLocaleString()} icon="🎯" color="#ef4444" />
+        <MetricCard title="Blocked"        value={loading ? "…" : (data?.blocked ?? 0).toLocaleString()} icon="🛡️" color="#22c55e" />
+        <MetricCard title="Block Rate"     value={loading ? "…" : `${blockRate}%`} icon="📊" color="#3b82f6" />
+        <MetricCard title="Threat Types"   value={loading ? "…" : Object.keys(data?.by_type ?? {}).length} icon="🔬" color="#8b5cf6" />
+        <MetricCard title="Top Attacker"   value={data?.top_attackers?.[0]?.ip ?? "—"} sub={`${data?.top_attackers?.[0]?.count ?? 0} hits`} icon="🌐" color="#f97316" />
+      </div>
+
+      {/* Charts row 1 */}
+      <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 16, marginBottom: 16 }}>
+        <ThreatTimelineChart timeSeries={data?.time_series ?? []} />
+        <SeverityPie bySeverity={data?.by_severity ?? {}} />
+      </div>
+
+      {/* Charts row 2 */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+        <ThreatTypeChart byType={data?.by_type ?? {}} />
+        <TopAttackers attackers={data?.top_attackers ?? []} />
+      </div>
     </div>
   );
 }
