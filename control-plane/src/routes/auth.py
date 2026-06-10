@@ -1,205 +1,249 @@
 """
-Thor Firewall — Authentication Routes
-نقاط نهاية التوثيق: تسجيل دخول، تجديد token، تسجيل خروج
-
-SPDX-License-Identifier: MIT
+Thor Firewall — Authentication Routes (Real PostgreSQL)
+=========================================================
+نقاط نهاية التوثيق — مستبدلة بـ PostgreSQL حقيقية.
 """
 from __future__ import annotations
-import logging, time, uuid
-from typing import Dict, Optional
+
+import hashlib
+import hmac
+import logging
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..auth.jwt_handler import (
     UserRole, create_access_token, create_refresh_token,
-    hash_password, verify_password, verify_token, revoke_token,
-    generate_api_key,
+    hash_password, verify_password, verify_token,
 )
 from ..auth.rbac import Permission, require_permission
+from ..db.models import User, RefreshToken, APIKey, AuditLog
+from ..db.session import get_db
 
 logger = logging.getLogger("thor.routes.auth")
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 security = HTTPBearer()
 
-# ── In-memory user store (استبدل بـ PostgreSQL) ───────────────────────────────
-_USERS: Dict[str, dict] = {
-    "admin@thor.local": {
-        "id":            "usr_admin_001",
-        "email":         "admin@thor.local",
-        "hashed_pw":     hash_password("Thor@Admin2024!"),
-        "role":          UserRole.ADMIN,
-        "name":          "Thor Admin",
-        "active":        True,
-        "created_at":    time.time(),
-        "last_login":    None,
-    },
-    "analyst@thor.local": {
-        "id":            "usr_analyst_001",
-        "email":         "analyst@thor.local",
-        "hashed_pw":     hash_password("Analyst@2024!"),
-        "role":          UserRole.ANALYST,
-        "name":          "SOC Analyst",
-        "active":        True,
-        "created_at":    time.time(),
-        "last_login":    None,
-    },
-}
 
-# Active refresh tokens (استبدل بـ Redis)
-_REFRESH_TOKENS: Dict[str, str] = {}   # token → user_id
-
-
-# ── Schemas ───────────────────────────────────────────────────────────────────
+# ── Request / Response schemas ────────────────────────────────────────────────
 
 class LoginRequest(BaseModel):
-    email: str
+    email:    str
     password: str = Field(..., min_length=8)
 
-class RegisterRequest(BaseModel):
-    email: EmailStr
-    password: str = Field(..., min_length=12, description="Min 12 chars, must include upper/lower/digit/special")
-    name: str = Field(..., min_length=2, max_length=100)
-    role: UserRole = UserRole.READONLY
-    invite_token: Optional[str] = None   # مطلوب للإنتاج
-
-class TokenResponse(BaseModel):
-    access_token: str
+class LoginResponse(BaseModel):
+    access_token:  str
     refresh_token: str
-    token_type: str = "bearer"
-    expires_in: int
-    user: dict
+    token_type:    str = "bearer"
+    expires_in:    int = 900   # 15 min
+
+class RegisterRequest(BaseModel):
+    email:    EmailStr
+    name:     str      = Field(..., min_length=2, max_length=128)
+    password: str      = Field(..., min_length=12)
+    role:     UserRole = UserRole.VIEWER
+
+class UserResponse(BaseModel):
+    id:         str
+    email:      str
+    name:       str
+    role:       str
+    is_active:  bool
+    created_at: str
 
 class RefreshRequest(BaseModel):
     refresh_token: str
 
-class ApiKeyResponse(BaseModel):
-    api_key: str
-    key_id: str
-    note: str = "Store this key securely — it won't be shown again"
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+async def _audit(db: AsyncSession, user_id, email, action, ip, status="success", details=None):
+    log = AuditLog(
+        user_id    = user_id,
+        user_email = email,
+        action     = action,
+        ip_address = ip,
+        status     = status,
+        details    = details,
+    )
+    db.add(log)
 
-@router.post("/login", response_model=TokenResponse)
-async def login(req: LoginRequest, request: Request):
-    user = _USERS.get(req.email)
-    if not user or not verify_password(req.password, user["hashed_pw"]):
-        logger.warning("Failed login attempt: %s from %s", req.email, request.client.host)
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@router.post("/login", response_model=LoginResponse)
+async def login(
+    body: LoginRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    ip = request.client.host if request.client else "unknown"
+
+    # Lookup user in PostgreSQL (no more in-memory dict)
+    result = await db.execute(select(User).where(User.email == body.email))
+    user   = result.scalar_one_or_none()
+
+    if not user or not user.is_active:
+        await _audit(db, None, body.email, "login", ip, status="failure",
+                     details={"reason": "user_not_found"})
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    if not verify_password(body.password, user.hashed_pw):
+        await _audit(db, str(user.id), user.email, "login", ip, status="failure",
+                     details={"reason": "wrong_password"})
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # Create tokens
+    access_token  = create_access_token({"sub": str(user.id), "role": user.role.value, "email": user.email})
+    refresh_token = create_refresh_token({"sub": str(user.id)})
+
+    # Persist refresh token in PostgreSQL (not in-memory dict)
+    rt = RefreshToken(
+        user_id    = user.id,
+        token_hash = _token_hash(refresh_token),
+        expires_at = datetime.now(timezone.utc) + timedelta(days=30),
+        ip_address = ip,
+        user_agent = request.headers.get("user-agent"),
+    )
+    db.add(rt)
+
+    # Update last_login
+    await db.execute(
+        update(User).where(User.id == user.id).values(
+            last_login=datetime.now(timezone.utc),
+            last_ip=ip,
         )
+    )
 
-    if not user["active"]:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account disabled")
+    await _audit(db, str(user.id), user.email, "login", ip, details={"role": user.role.value})
+    return LoginResponse(access_token=access_token, refresh_token=refresh_token)
 
-    user["last_login"] = time.time()
-    access  = create_access_token(user["id"], user["role"], user["email"])
-    refresh = create_refresh_token(user["id"], user["role"])
-    _REFRESH_TOKENS[refresh] = user["id"]
 
-    logger.info("User logged in: %s (role=%s)", user["email"], user["role"].value)
+@router.post("/refresh", response_model=LoginResponse)
+async def refresh(
+    body: RefreshRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Rotate refresh token — stored in PostgreSQL."""
+    payload = verify_token(body.refresh_token, token_type="refresh")
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
 
-    return TokenResponse(
-        access_token=access, refresh_token=refresh, expires_in=900,
-        user={"id": user["id"], "email": user["email"], "name": user["name"], "role": user["role"].value},
+    token_hash = _token_hash(body.refresh_token)
+    result = await db.execute(
+        select(RefreshToken).where(
+            RefreshToken.token_hash == token_hash,
+            RefreshToken.revoked == False,
+            RefreshToken.expires_at > datetime.now(timezone.utc),
+        )
+    )
+    rt = result.scalar_one_or_none()
+    if not rt:
+        raise HTTPException(status_code=401, detail="Token revoked or expired")
+
+    # Revoke old token
+    rt.revoked    = True
+    rt.revoked_at = datetime.now(timezone.utc)
+
+    # Get user
+    result = await db.execute(select(User).where(User.id == rt.user_id))
+    user   = result.scalar_one_or_none()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="User disabled")
+
+    # Issue new tokens
+    access_token  = create_access_token({"sub": str(user.id), "role": user.role.value, "email": user.email})
+    new_refresh   = create_refresh_token({"sub": str(user.id)})
+
+    new_rt = RefreshToken(
+        user_id    = user.id,
+        token_hash = _token_hash(new_refresh),
+        expires_at = datetime.now(timezone.utc) + timedelta(days=30),
+        ip_address = request.client.host if request.client else None,
+    )
+    db.add(new_rt)
+    return LoginResponse(access_token=access_token, refresh_token=new_refresh)
+
+
+@router.post("/logout")
+async def logout(
+    body: RefreshRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Revoke refresh token in PostgreSQL."""
+    token_hash = _token_hash(body.refresh_token)
+    result = await db.execute(
+        select(RefreshToken).where(RefreshToken.token_hash == token_hash)
+    )
+    rt = result.scalar_one_or_none()
+    if rt:
+        rt.revoked    = True
+        rt.revoked_at = datetime.now(timezone.utc)
+    return {"message": "Logged out"}
+
+
+@router.post("/register", response_model=UserResponse)
+async def register(
+    body: RegisterRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission(Permission.USER_MANAGE)),
+):
+    """Register new user — admin only, stored in PostgreSQL."""
+    # Check duplicate
+    result = await db.execute(select(User).where(User.email == body.email))
+    if result.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Email already registered")
+
+    user = User(
+        email      = body.email,
+        name       = body.name,
+        hashed_pw  = hash_password(body.password),
+        role       = body.role,
+        is_active  = True,
+    )
+    db.add(user)
+    await db.flush()  # get ID without committing
+
+    ip = request.client.host if request.client else "unknown"
+    await _audit(db, str(user.id), user.email, "register", ip,
+                 details={"role": body.role.value})
+
+    return UserResponse(
+        id=str(user.id), email=user.email, name=user.name,
+        role=user.role.value, is_active=user.is_active,
+        created_at=user.created_at.isoformat() if user.created_at else "",
     )
 
 
-@router.post("/refresh", response_model=TokenResponse)
-async def refresh_token(req: RefreshRequest):
-    try:
-        payload = verify_token(req.refresh_token)
-    except ValueError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+@router.get("/me", response_model=UserResponse)
+async def me(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: AsyncSession = Depends(get_db),
+):
+    payload = verify_token(credentials.credentials)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-    if payload.token_type != "refresh":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Not a refresh token")
-
-    user_id = _REFRESH_TOKENS.get(req.refresh_token)
-    if not user_id:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token not found or expired")
-
-    # Rotate refresh token
-    revoke_token(req.refresh_token)
-    del _REFRESH_TOKENS[req.refresh_token]
-
-    user = next((u for u in _USERS.values() if u["id"] == user_id), None)
+    result = await db.execute(select(User).where(User.id == uuid.UUID(payload["sub"])))
+    user   = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    new_access  = create_access_token(user["id"], user["role"], user["email"])
-    new_refresh = create_refresh_token(user["id"], user["role"])
-    _REFRESH_TOKENS[new_refresh] = user["id"]
-
-    return TokenResponse(
-        access_token=new_access, refresh_token=new_refresh, expires_in=900,
-        user={"id": user["id"], "email": user["email"], "name": user["name"], "role": user["role"].value},
+    return UserResponse(
+        id=str(user.id), email=user.email, name=user.name,
+        role=user.role.value, is_active=user.is_active,
+        created_at=user.created_at.isoformat() if user.created_at else "",
     )
-
-
-@router.post("/logout", status_code=204)
-async def logout(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    revoke_token(credentials.credentials)
-
-
-@router.post("/register", response_model=dict, status_code=201)
-async def register(req: RegisterRequest, credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """تسجيل مستخدم جديد — يتطلب دور admin"""
-    caller = verify_token(credentials.credentials)
-    if caller.role != UserRole.ADMIN:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admins can register users")
-
-    if req.email in _USERS:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
-
-    # Password strength
-    pw = req.password
-    if not any(c.isupper() for c in pw) or not any(c.isdigit() for c in pw) or not any(c in "!@#$%^&*" for c in pw):
-        raise HTTPException(status_code=422, detail="Password must contain uppercase, digit and special character")
-
-    user_id = f"usr_{uuid.uuid4().hex[:8]}"
-    _USERS[req.email] = {
-        "id": user_id, "email": req.email,
-        "hashed_pw": hash_password(req.password),
-        "role": req.role, "name": req.name,
-        "active": True, "created_at": time.time(), "last_login": None,
-    }
-    logger.info("New user registered: %s (role=%s) by %s", req.email, req.role.value, caller.sub)
-    return {"id": user_id, "email": req.email, "role": req.role.value}
-
-
-@router.post("/agents/keys", response_model=ApiKeyResponse)
-async def create_agent_key(
-    node_name: str,
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-):
-    """إنشاء API key لـ agent جديد — يتطلب admin"""
-    caller = verify_token(credentials.credentials)
-    if caller.role != UserRole.ADMIN:
-        raise HTTPException(status_code=403, detail="Admin only")
-
-    raw_key, hashed_key = generate_api_key()
-    key_id = f"key_{uuid.uuid4().hex[:8]}"
-
-    from ..middleware.auth_middleware import register_agent_key
-    agent_id = f"agent_{uuid.uuid4().hex[:8]}"
-    register_agent_key(hashed_key, agent_id, node_name)
-
-    logger.info("Agent key created: node=%s id=%s by=%s", node_name, agent_id, caller.sub)
-    return ApiKeyResponse(api_key=raw_key, key_id=key_id)
-
-
-@router.get("/me")
-async def get_me(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = verify_token(credentials.credentials)
-    user = next((u for u in _USERS.values() if u["id"] == token.sub), None)
-    if not user:
-        return {"id": token.sub, "role": token.role.value, "type": token.token_type}
-    return {
-        "id": user["id"], "email": user["email"],
-        "name": user["name"], "role": user["role"].value,
-        "last_login": user["last_login"],
-    }
