@@ -1,0 +1,748 @@
+# Thor Firewall — Full Production Stack
+# ═══════════════════════════════════════════════════════════════════════════════
+# يشمل جميع الأدوات الـ 30+ موزعة على profiles للتشغيل المرحلي
+#
+# الاستخدام:
+#   المرحلة 1: docker compose -f docker-compose.full.yml --profile phase1 up -d
+#   المرحلة 2: docker compose -f docker-compose.full.yml --profile phase2 up -d
+#   المرحلة 3: docker compose -f docker-compose.full.yml --profile phase3 up -d
+#   الكل:      docker compose -f docker-compose.full.yml --profile all up -d
+# ═══════════════════════════════════════════════════════════════════════════════
+
+version: "3.9"
+
+networks:
+  thor-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+  thor-obs-net:
+    driver: bridge
+  thor-ml-net:
+    driver: bridge
+  thor-edr-net:
+    driver: bridge
+  thor-ndr-net:
+    driver: bridge
+
+volumes:
+  # SIEM / Log Management
+  loki_data:
+  promtail_data:
+  graylog_data:
+  graylog_mongo_data:
+  graylog_es_data:
+  vector_data:
+  # EDR
+  velociraptor_data:
+  velociraptor_clients:
+  osquery_data:
+  # SOAR
+  cortex_data:
+  tracecat_db_data:
+  tracecat_data:
+  # NDR
+  zeek_logs:
+  arkime_data:
+  arkime_pcap:
+  malcolm_data:
+  # CTI
+  yeti_data:
+  yeti_mongo_data:
+  yeti_es_data:
+  spiderfoot_data:
+  # Vulnerability Management
+  openvas_data:
+  openvas_db_data:
+  defectdojo_data:
+  defectdojo_db_data:
+  defectdojo_media:
+  zap_data:
+  # Cloud / Container Security
+  falco_data:
+  trivy_data:
+  # GRC
+  ciso_db_data:
+  ciso_data:
+  # Deception
+  trapster_data:
+  # DFIR
+  dissect_data:
+
+services:
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── PHASE 1: SIEM / Log Management ──────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  # Grafana Loki — خفيف وسريع لاستيعاب السجلات
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: thor-loki
+    profiles: ["phase1", "siem", "all"]
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/config.yaml
+    volumes:
+      - loki_data:/loki
+      - ./configs/loki/config.yaml:/etc/loki/config.yaml:ro
+    networks:
+      - thor-obs-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3100/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # Promtail — عميل جمع السجلات لـ Loki
+  promtail:
+    image: grafana/promtail:3.0.0
+    container_name: thor-promtail
+    profiles: ["phase1", "siem", "all"]
+    restart: unless-stopped
+    volumes:
+      - promtail_data:/tmp
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - ./configs/promtail/config.yaml:/etc/promtail/config.yaml:ro
+    command: -config.file=/etc/promtail/config.yaml
+    networks:
+      - thor-obs-net
+    depends_on:
+      - loki
+
+  # Graylog — SIEM مركزي مع محرك بحث قوي
+  graylog-mongo:
+    image: mongo:6.0
+    container_name: thor-graylog-mongo
+    profiles: ["phase1", "siem", "all"]
+    restart: unless-stopped
+    volumes:
+      - graylog_mongo_data:/data/db
+    networks:
+      - thor-net
+
+  graylog-es:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.20
+    container_name: thor-graylog-es
+    profiles: ["phase1", "siem", "all"]
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    volumes:
+      - graylog_es_data:/usr/share/elasticsearch/data
+    networks:
+      - thor-net
+
+  graylog:
+    image: graylog/graylog:6.0
+    container_name: thor-graylog
+    profiles: ["phase1", "siem", "all"]
+    restart: unless-stopped
+    depends_on:
+      - graylog-mongo
+      - graylog-es
+    ports:
+      - "9001:9000"    # Web UI
+      - "1514:1514"    # Syslog TCP
+      - "1514:1514/udp"
+      - "12201:12201/udp" # GELF UDP
+    environment:
+      GRAYLOG_PASSWORD_SECRET: "${GRAYLOG_PASSWORD_SECRET:-somepasswordpepper32chars!}"
+      GRAYLOG_ROOT_PASSWORD_SHA2: "${GRAYLOG_ROOT_PASSWORD_SHA2:-8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918}"
+      GRAYLOG_HTTP_EXTERNAL_URI: "http://localhost:9001/"
+      GRAYLOG_ELASTICSEARCH_HOSTS: "http://graylog-es:9200"
+      GRAYLOG_MONGODB_URI: "mongodb://graylog-mongo:27017/graylog"
+    volumes:
+      - graylog_data:/usr/share/graylog/data
+    networks:
+      - thor-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/api/system/lbstatus | grep -q ALIVE"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  # Vector — توجيه السجلات عالي الأداء
+  vector:
+    image: timberio/vector:0.39.0-alpine
+    container_name: thor-vector
+    profiles: ["phase1", "siem", "all"]
+    restart: unless-stopped
+    ports:
+      - "8686:8686"   # API
+      - "9514:9514"   # Syslog input
+    volumes:
+      - vector_data:/var/lib/vector
+      - ./configs/vector/vector.yaml:/etc/vector/vector.yaml:ro
+      - /var/log:/var/log:ro
+    command: --config /etc/vector/vector.yaml
+    networks:
+      - thor-net
+      - thor-obs-net
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── PHASE 1: NDR / Network Detection ────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  # Zeek — تحليل بروتوكولات الشبكة وإنتاج metadata
+  zeek:
+    image: zeek/zeek:6.2.1
+    container_name: thor-zeek
+    profiles: ["phase1", "ndr", "all"]
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - zeek_logs:/usr/local/zeek/logs
+      - ./configs/zeek/local.zeek:/usr/local/zeek/share/zeek/site/local.zeek:ro
+    command: zeekctl deploy
+    environment:
+      ZEEK_IFACE: "${SURICATA_INTERFACE:-eth0}"
+
+  # Arkime — التقاط كامل للحزم
+  arkime:
+    image: ghcr.io/arkime/arkime:5.0.0
+    container_name: thor-arkime
+    profiles: ["phase1", "ndr", "all"]
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    ports:
+      - "8005:8005"   # Web UI
+    volumes:
+      - arkime_data:/data/arkime
+      - arkime_pcap:/data/pcap
+      - ./configs/arkime/config.ini:/opt/arkime/etc/config.ini:ro
+    environment:
+      ARKIME_ELASTICSEARCH: "http://localhost:9200"
+      ARKIME_INTERFACE: "${SURICATA_INTERFACE:-eth0}"
+      ARKIME_PASSWORD: "${ARKIME_PASSWORD:-ArkimeThor2024!}"
+
+  # OpenVAS / GVM — مسح الثغرات الأمنية
+  openvas:
+    image: greenbone/gvm:latest
+    container_name: thor-openvas
+    profiles: ["phase1", "vuln", "all"]
+    restart: unless-stopped
+    ports:
+      - "9392:9392"   # Web UI (Greenbone Security Assistant)
+      - "9390:9390"   # GMP (Greenbone Management Protocol)
+    volumes:
+      - openvas_data:/var/lib/openvas
+      - openvas_db_data:/var/lib/postgresql
+    environment:
+      ADMIN_PASSWORD: "${OPENVAS_ADMIN_PASSWORD:-OpenVASThor2024!}"
+      DB_PASSWORD: "${OPENVAS_DB_PASSWORD:-openvas_db_pass}"
+    networks:
+      - thor-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sk https://localhost:9392/login | grep -q 'Greenbone'"]
+      interval: 60s
+      timeout: 15s
+      retries: 10
+      start_period: 300s  # GVM يحتاج وقتاً لتحميل NVD feeds
+
+  # DefectDojo — إدارة نتائج فحص الثغرات
+  defectdojo-db:
+    image: postgres:16-alpine
+    container_name: thor-defectdojo-db
+    profiles: ["phase1", "vuln", "all"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: defectdojo
+      POSTGRES_USER: defectdojo
+      POSTGRES_PASSWORD: "${DEFECTDOJO_DB_PASSWORD:-defectdojo_pass}"
+    volumes:
+      - defectdojo_db_data:/var/lib/postgresql/data
+    networks:
+      - thor-net
+
+  defectdojo:
+    image: defectdojo/defectdojo-django:2.36.0
+    container_name: thor-defectdojo
+    profiles: ["phase1", "vuln", "all"]
+    restart: unless-stopped
+    depends_on:
+      - defectdojo-db
+    ports:
+      - "8090:8080"   # Web UI
+    environment:
+      DD_DATABASE_URL: "postgresql://defectdojo:${DEFECTDOJO_DB_PASSWORD:-defectdojo_pass}@defectdojo-db:5432/defectdojo"
+      DD_SECRET_KEY: "${DEFECTDOJO_SECRET_KEY:-s3cr3t_defectdojo_change_in_prod}"
+      DD_ADMIN_USER: admin
+      DD_ADMIN_PASSWORD: "${DEFECTDOJO_ADMIN_PASSWORD:-DefectDojoThor2024!}"
+      DD_ALLOWED_HOSTS: "*"
+    volumes:
+      - defectdojo_media:/app/media
+      - defectdojo_data:/app/data
+    networks:
+      - thor-net
+
+  # Falco — أمن runtime للحاويات
+  falco:
+    image: falcosecurity/falco-no-driver:0.38.1
+    container_name: thor-falco
+    profiles: ["phase1", "cloud", "all"]
+    restart: unless-stopped
+    privileged: true
+    volumes:
+      - /var/run/docker.sock:/host/var/run/docker.sock
+      - /proc:/host/proc:ro
+      - /boot:/host/boot:ro
+      - /lib/modules:/host/lib/modules:ro
+      - /usr:/host/usr:ro
+      - falco_data:/var/lib/falco
+      - ./configs/falco/falco.yaml:/etc/falco/falco.yaml:ro
+      - ./configs/falco/rules:/etc/falco/rules.d:ro
+    command: falco --modern-bpf --disable-source=syscall
+    environment:
+      FALCO_BPF_PROBE: ""
+    networks:
+      - thor-net
+
+  # Trivy — فحص ثغرات الحاويات
+  trivy:
+    image: aquasec/trivy:0.53.0
+    container_name: thor-trivy
+    profiles: ["phase1", "cloud", "all"]
+    restart: "no"   # تشغيل عند الطلب: docker compose run trivy image <image>
+    volumes:
+      - trivy_data:/root/.cache/trivy
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: server --listen 0.0.0.0:4954
+    ports:
+      - "4954:4954"
+    networks:
+      - thor-net
+
+  # OWASP ZAP — DAST لاختبار أمان التطبيقات
+  owasp-zap:
+    image: ghcr.io/zaproxy/zaproxy:stable
+    container_name: thor-owasp-zap
+    profiles: ["phase1", "appsec", "all"]
+    restart: unless-stopped
+    ports:
+      - "8091:8080"   # ZAP Web UI
+      - "8092:8090"   # ZAP API
+    volumes:
+      - zap_data:/zap/wrk
+    command: zap-webswing.sh
+    environment:
+      ZAP_PORT: "8080"
+    networks:
+      - thor-net
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── PHASE 1: EDR / Endpoint Detection ────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  # Velociraptor — DFIR ومنصة EDR مفتوحة المصدر
+  velociraptor:
+    image: wearecircuit/velociraptor:v0.72
+    container_name: thor-velociraptor
+    profiles: ["phase1", "edr", "all"]
+    restart: unless-stopped
+    ports:
+      - "8889:8889"   # GUI
+      - "8000:8000"   # Client enrollment
+      - "8001:8001"   # Frontend
+    volumes:
+      - velociraptor_data:/velociraptor
+      - velociraptor_clients:/clients
+      - ./configs/velociraptor/server.config.yaml:/velociraptor/server.config.yaml:ro
+    command: frontend -v
+    networks:
+      - thor-edr-net
+      - thor-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sk https://localhost:8889 | grep -q Velociraptor"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # Osquery — استعلام SQL عن حالة الأجهزة
+  osquery-fleet:
+    image: fleetdm/fleet:v4.51.0
+    container_name: thor-osquery-fleet
+    profiles: ["phase1", "edr", "all"]
+    restart: unless-stopped
+    depends_on:
+      - osquery-db
+      - osquery-redis
+    ports:
+      - "8080:8080"   # Fleet Web UI
+    environment:
+      FLEET_MYSQL_ADDRESS: "osquery-db:3306"
+      FLEET_MYSQL_DATABASE: fleet
+      FLEET_MYSQL_USERNAME: fleet
+      FLEET_MYSQL_PASSWORD: "${FLEET_DB_PASSWORD:-fleet_pass}"
+      FLEET_REDIS_ADDRESS: "osquery-redis:6379"
+      FLEET_SERVER_TLS: "false"
+      FLEET_AUTH_JWT_KEY: "${FLEET_JWT_KEY:-fleet_jwt_key_change_me}"
+    command: fleet serve
+    networks:
+      - thor-edr-net
+      - thor-net
+
+  osquery-db:
+    image: mysql:8.0
+    container_name: thor-osquery-db
+    profiles: ["phase1", "edr", "all"]
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: "${FLEET_DB_ROOT:-fleet_root_pass}"
+      MYSQL_DATABASE: fleet
+      MYSQL_USER: fleet
+      MYSQL_PASSWORD: "${FLEET_DB_PASSWORD:-fleet_pass}"
+    volumes:
+      - osquery_data:/var/lib/mysql
+    networks:
+      - thor-edr-net
+
+  osquery-redis:
+    image: redis:7.2-alpine
+    container_name: thor-osquery-redis
+    profiles: ["phase1", "edr", "all"]
+    restart: unless-stopped
+    networks:
+      - thor-edr-net
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── PHASE 2: CTI / Threat Intelligence ──────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  # Yeti — مستودع IoCs و TTPs
+  yeti-mongo:
+    image: mongo:6.0
+    container_name: thor-yeti-mongo
+    profiles: ["phase2", "cti", "all"]
+    restart: unless-stopped
+    volumes:
+      - yeti_mongo_data:/data/db
+    networks:
+      - thor-net
+
+  yeti-es:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    container_name: thor-yeti-es
+    profiles: ["phase2", "cti", "all"]
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    volumes:
+      - yeti_es_data:/usr/share/elasticsearch/data
+    networks:
+      - thor-net
+
+  yeti:
+    image: yetiplatform/yeti:latest
+    container_name: thor-yeti
+    profiles: ["phase2", "cti", "all"]
+    restart: unless-stopped
+    depends_on:
+      - yeti-mongo
+      - yeti-es
+    ports:
+      - "8093:8080"   # Yeti Web UI
+    environment:
+      YETI_MONGO_URI: "mongodb://yeti-mongo:27017/yeti"
+      YETI_ELASTICSEARCH_URL: "http://yeti-es:9200"
+      YETI_AUTH_SECRET: "${YETI_SECRET:-yeti_secret_change_me}"
+    volumes:
+      - yeti_data:/app/data
+    networks:
+      - thor-net
+
+  # SpiderFoot — جمع وتحليل OSINT آلي
+  spiderfoot:
+    image: smicallef/spiderfoot:latest
+    container_name: thor-spiderfoot
+    profiles: ["phase2", "cti", "all"]
+    restart: unless-stopped
+    ports:
+      - "5009:5001"   # SpiderFoot Web UI
+    volumes:
+      - spiderfoot_data:/home/spiderfoot/.spiderfoot
+    environment:
+      SFLITE: "/home/spiderfoot/.spiderfoot/spiderfoot.db"
+    networks:
+      - thor-net
+
+  # CISO Assistant — منصة GRC + امتثال ISO27001/SOC2/NCA-ECC
+  ciso-db:
+    image: postgres:16-alpine
+    container_name: thor-ciso-db
+    profiles: ["phase2", "grc", "all"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ciso
+      POSTGRES_USER: ciso
+      POSTGRES_PASSWORD: "${CISO_DB_PASSWORD:-ciso_db_pass}"
+    volumes:
+      - ciso_db_data:/var/lib/postgresql/data
+    networks:
+      - thor-net
+
+  ciso-assistant:
+    image: intuitem/ciso-assistant-community:latest
+    container_name: thor-ciso-assistant
+    profiles: ["phase2", "grc", "all"]
+    restart: unless-stopped
+    depends_on:
+      - ciso-db
+    ports:
+      - "8094:8080"   # CISO Assistant Web UI
+    environment:
+      DATABASE_URL: "postgresql://ciso:${CISO_DB_PASSWORD:-ciso_db_pass}@ciso-db:5432/ciso"
+      DJANGO_SECRET_KEY: "${CISO_SECRET_KEY:-ciso_secret_change_in_prod}"
+      DJANGO_SUPERUSER_EMAIL: "${CISO_ADMIN_EMAIL:-admin@thor.local}"
+      DJANGO_SUPERUSER_PASSWORD: "${CISO_ADMIN_PASSWORD:-CisoThor2024!}"
+      ALLOWED_HOSTS: "*"
+    volumes:
+      - ciso_data:/app/media
+    networks:
+      - thor-net
+
+  # Cortex — إثراء وتحليل التهديدات (مكمل TheHive)
+  cortex:
+    image: thehiveproject/cortex:3.1.8
+    container_name: thor-cortex
+    profiles: ["phase2", "soar", "all"]
+    restart: unless-stopped
+    depends_on:
+      - cortex-es
+    ports:
+      - "9001:9001"   # Cortex Web UI
+    volumes:
+      - cortex_data:/var/lib/cortex
+      - ./configs/cortex/application.conf:/etc/cortex/application.conf:ro
+      - /var/run/docker.sock:/var/run/docker.sock  # لتشغيل الـ Analyzers
+    environment:
+      JOB_DIRECTORY: /tmp/cortex-jobs
+    networks:
+      - thor-net
+
+  cortex-es:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.20
+    container_name: thor-cortex-es
+    profiles: ["phase2", "soar", "all"]
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      - cluster.name=cortex
+    networks:
+      - thor-net
+
+  # Tracecat — SOAR حديث للاستجابة الآلية
+  tracecat-db:
+    image: postgres:16-alpine
+    container_name: thor-tracecat-db
+    profiles: ["phase2", "soar", "all"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: tracecat
+      POSTGRES_USER: tracecat
+      POSTGRES_PASSWORD: "${TRACECAT_DB_PASSWORD:-tracecat_pass}"
+    volumes:
+      - tracecat_db_data:/var/lib/postgresql/data
+    networks:
+      - thor-net
+
+  tracecat:
+    image: ghcr.io/tracecathq/tracecat:0.14.5
+    container_name: thor-tracecat
+    profiles: ["phase2", "soar", "all"]
+    restart: unless-stopped
+    depends_on:
+      - tracecat-db
+    ports:
+      - "8095:8000"   # Tracecat API
+      - "3010:3000"   # Tracecat UI
+    environment:
+      DATABASE_URI: "postgresql+psycopg://tracecat:${TRACECAT_DB_PASSWORD:-tracecat_pass}@tracecat-db:5432/tracecat"
+      TRACECAT__APP_ENV: production
+      TRACECAT__DB_ENCRYPTION_KEY: "${TRACECAT_ENCRYPTION_KEY:-tracecat_enc_key_32chars_change!}"
+      TRACECAT__SERVICE_KEY: "${TRACECAT_SERVICE_KEY:-tracecat_service_key_change_me!}"
+      TRACECAT__SIGNING_SECRET: "${TRACECAT_SIGNING_SECRET:-tracecat_signing_secret_change!}"
+    volumes:
+      - tracecat_data:/app/data
+    networks:
+      - thor-net
+
+  # OpenUBA — تحليل سلوك المستخدمين (UEBA)
+  openuba:
+    image: ghcr.io/open-uba/open-uba:latest
+    container_name: thor-openuba
+    profiles: ["phase2", "ueba", "all"]
+    restart: unless-stopped
+    ports:
+      - "8096:8080"
+    environment:
+      ELASTICSEARCH_URL: "http://elasticsearch:9200"
+      ELASTICSEARCH_USERNAME: elastic
+      ELASTICSEARCH_PASSWORD: "${ELASTIC_PASSWORD:-ElasticThor2024!}"
+    networks:
+      - thor-net
+      - thor-ml-net
+
+  # Semgrep — SAST لكشف الثغرات في الكود
+  semgrep:
+    image: returntocorp/semgrep:1.77.0
+    container_name: thor-semgrep
+    profiles: ["phase2", "appsec", "all"]
+    restart: "no"   # تشغيل عند الطلب
+    volumes:
+      - ./:/src:ro
+    command: scan --config=auto --json /src
+    networks:
+      - thor-net
+
+  # Gitleaks — كشف التسريبات قبل الـ commit
+  gitleaks:
+    image: zricethezav/gitleaks:v8.18.4
+    container_name: thor-gitleaks
+    profiles: ["phase2", "appsec", "all"]
+    restart: "no"   # تشغيل عند الطلب
+    volumes:
+      - ./:/repo:ro
+    command: detect --source /repo --report-format json --report-path /repo/gitleaks-report.json
+    networks:
+      - thor-net
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── PHASE 2: Cloud / Container Security ─────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  # kube-hunter — كشف ثغرات Kubernetes
+  kube-hunter:
+    image: aquasec/kube-hunter:v0.6.8
+    container_name: thor-kube-hunter
+    profiles: ["phase2", "cloud", "all"]
+    restart: "no"   # تشغيل عند الطلب
+    command: --remote ${KUBE_HUNTER_TARGET:-127.0.0.1} --report json
+    network_mode: host
+
+  # Prowler — تقييم أمن السحابة مع CIS benchmarks
+  prowler:
+    image: docker.io/toniblyx/prowler:latest
+    container_name: thor-prowler
+    profiles: ["phase2", "cloud", "all"]
+    restart: "no"   # تشغيل عند الطلب
+    volumes:
+      - ~/.aws:/root/.aws:ro
+      - ./reports/prowler:/home/prowler/output
+    command: aws --output-formats json-asff html --output-directory /home/prowler/output
+    networks:
+      - thor-net
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── PHASE 3: Advanced Log / SIEM ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  # Deception — Trapster honeypot
+  trapster:
+    image: ghcr.io/trapster-community/trapster:latest
+    container_name: thor-trapster
+    profiles: ["phase3", "deception", "all"]
+    restart: unless-stopped
+    ports:
+      - "21:21"      # Fake FTP
+      - "23:23"      # Fake Telnet
+      - "2222:22"    # Fake SSH
+      - "8097:80"    # Fake HTTP
+      - "8098:443"   # Fake HTTPS
+      - "3389:3389"  # Fake RDP
+    environment:
+      TRAPSTER_LOKI_URL: "http://loki:3100"
+      TRAPSTER_LOG_LEVEL: INFO
+    volumes:
+      - trapster_data:/app/data
+      - ./configs/trapster/config.yaml:/app/config.yaml:ro
+    networks:
+      - thor-net
+    cap_add:
+      - NET_BIND_SERVICE
+
+  # DFIR — Dissect لتحليل الأدلة على نطاق واسع
+  dissect:
+    image: ghcr.io/fox-it/dissect:latest
+    container_name: thor-dissect
+    profiles: ["phase3", "dfir", "all"]
+    restart: "no"   # تشغيل عند الطلب
+    volumes:
+      - dissect_data:/data
+      - ./evidence:/evidence:ro
+    command: target-query -f /evidence /evidence/**/*
+    networks:
+      - thor-net
+
+  # Malcolm — حزمة NDR متكاملة (Zeek + Suricata + Arkime)
+  malcolm-dashboards:
+    image: ghcr.io/cisagov/malcolm/malcolm-dashboards:24.04.0
+    container_name: thor-malcolm-dashboards
+    profiles: ["phase3", "ndr", "all"]
+    restart: unless-stopped
+    ports:
+      - "5602:5601"   # Kibana-style UI
+    environment:
+      OPENSEARCH_URL: "http://malcolm-os:9200"
+    networks:
+      - thor-ndr-net
+
+  malcolm-os:
+    image: ghcr.io/cisagov/malcolm/malcolm-opensearch:24.04.0
+    container_name: thor-malcolm-os
+    profiles: ["phase3", "ndr", "all"]
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - plugins.security.disabled=true
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+    volumes:
+      - malcolm_data:/usr/share/opensearch/data
+    networks:
+      - thor-ndr-net
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── Threat Intelligence Pipeline ────────────────────────────────────────────
+# يجمع MISP + Yeti + OpenCTI + SpiderFoot في pipeline واحد
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  # SpiderFoot HX → MISP bridge (Python script container)
+  spiderfoot-misp-bridge:
+    image: python:3.12-slim
+    container_name: thor-cti-bridge
+    profiles: ["phase2", "cti", "all"]
+    restart: unless-stopped
+    volumes:
+      - ./scripts/cti_bridge.py:/app/cti_bridge.py:ro
+    command: >
+      bash -c "pip install -q pymisp requests schedule && python /app/cti_bridge.py"
+    environment:
+      MISP_URL: "http://misp:80"
+      MISP_AUTH_KEY: "${MISP_AUTH_KEY}"
+      SPIDERFOOT_URL: "http://spiderfoot:5001"
+      YETI_URL: "http://yeti:8080"
+      OPENCTI_URL: "http://opencti:8080"
+      OPENCTI_TOKEN: "${OPENCTI_ADMIN_TOKEN:-thor_api_token_placeholder}"
+      SYNC_INTERVAL_MINUTES: "60"
+    depends_on:
+      - spiderfoot
+      - yeti
+    networks:
+      - thor-net
