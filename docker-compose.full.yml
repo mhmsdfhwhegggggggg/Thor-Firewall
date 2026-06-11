@@ -525,7 +525,7 @@ services:
     depends_on:
       - cortex-es
     ports:
-      - "9001:9001"   # Cortex Web UI
+      - "9002:9001"   # Cortex Web UI
     volumes:
       - cortex_data:/var/lib/cortex
       - ./configs/cortex/application.conf:/etc/cortex/application.conf:ro
