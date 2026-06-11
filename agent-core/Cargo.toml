@@ -1,38 +1,62 @@
 [package]
 name = "thor-agent"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-# الشبكات والباكت
-pcap = "1.0"
-libc = "0.2"
-socket2 = "0.5"
+# ── شبكات وباكت ─────────────────────────────────────────────
+pcap     = "1.0"
+libc     = "0.2"
+socket2  = "0.5"
 
-# eBPF (Linux)
-aya = "0.12"
-aya-log = "0.12"
+# ── eBPF (Linux only) ────────────────────────────────────────
+aya      = { version = "0.12", optional = true }
+aya-log  = { version = "0.12", optional = true }
 
-# ويندوز WFP عبر FFI
-winapi = { version = "0.3", features = ["ws2ipdef", "windowsfilteringplatform"]}
-windows = "0.54"
+# ── Wazuh Integration (مدمج بالكامل) ─────────────────────────
+wazuh-client = "0.1.8"
 
-# الذكاء الاصطناعي
-tch = "0.12"   # PyTorch binding للـ RL
-candle-core = "0.4"  # بديل خفيف للـ LLM
+# ── الذكاء الاصطناعي ─────────────────────────────────────────
+candle-core  = { version = "0.4", optional = true }
 
-# معالجة البيانات
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.0", features = ["full"] }
-chrono = "0.4"
+# ── HTTP Client (مشترك بين wazuh + inference + llm) ──────────
+reqwest  = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
-# السجلات والمراقبة
-log = "0.4"
-env_logger = "0.10"
+# ── Serialisation ─────────────────────────────────────────────
+serde       = { version = "1.0", features = ["derive"] }
+serde_json  = "1.0"
 
-[target.'cfg(target_os="linux")'.dependencies]
-aya = "0.12"
+# ── Async runtime ─────────────────────────────────────────────
+tokio    = { version = "1.0", features = ["full"] }
 
-[target.'cfg(target_os="windows")'.dependencies]
-winapi = "0.3"
+# ── وقت وتوثيق ───────────────────────────────────────────────
+chrono   = { version = "0.4", features = ["serde"] }
+uuid     = { version = "1.0", features = ["v4", "serde"] }
+
+# ── سجلات ────────────────────────────────────────────────────
+log          = "0.4"
+env_logger   = "0.11"
+tracing      = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ── أدوات مساعدة ──────────────────────────────────────────────
+thiserror    = "2.0"
+urlencoding  = "2.1"
+tempfile     = "3.0"
+
+[features]
+default = []
+ebpf    = ["aya", "aya-log"]
+ml      = ["candle-core"]
+full    = ["ebpf", "ml"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya     = { version = "0.12", optional = true }
+aya-log = { version = "0.12", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winapi  = { version = "0.3", features = ["ws2ipdef", "windowsfilteringplatform"], optional = true }
+
+[[bin]]
+name = "thor-agent"
+path = "src/main.rs"
