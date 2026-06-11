@@ -1,0 +1,59 @@
+{
+  "id": "thor-ip-block-workflow",
+  "name": "Thor — Auto IP Block on Alert",
+  "description": "يستقبل تنبيهاً من TheHive ويحظر IP المصدر تلقائياً عبر iptables لمدة 60 دقيقة",
+  "tags": ["thor", "auto-response", "ip-block"],
+  "triggers": [
+    {
+      "id": "webhook-trigger",
+      "app_name": "Webhook",
+      "name": "TheHive Alert Webhook",
+      "type": "WEBHOOK",
+      "parameters": [{ "name": "url_suffix", "value": "/thor-ip-block" }]
+    }
+  ],
+  "actions": [
+    {
+      "id": "extract-ip",
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "name": "Extract Source IP",
+      "parameters": [
+        { "name": "input_data", "value": "$exec" },
+        { "name": "regex", "value": "\\b(?:[0-9]{1,3}\\.){3}[0-9]{1,3}\\b" }
+      ]
+    },
+    {
+      "id": "check-whitelist",
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "name": "Skip if Private IP",
+      "parameters": [
+        { "name": "input_data",  "value": "$extract-ip" },
+        { "name": "check",       "value": "not in [\"127.0.0.1\",\"0.0.0.0\",\"10.0.0.1\",\"192.168.1.1\"]" }
+      ]
+    },
+    {
+      "id": "block-iptables",
+      "app_name": "SSH",
+      "app_version": "1.0.0",
+      "name": "Block IP 60min via iptables",
+      "parameters": [
+        { "name": "host",    "value": "${FIREWALL_HOST:-localhost}" },
+        { "name": "command", "value": "iptables -I INPUT -s $check-whitelist -j DROP -m comment --comment 'thor-auto-block' && (sleep 3600 && iptables -D INPUT -s $check-whitelist -j DROP -m comment --comment 'thor-auto-block') &" }
+      ]
+    },
+    {
+      "id": "notify-thehive",
+      "app_name": "TheHive",
+      "app_version": "1.0.0",
+      "name": "Add Note to TheHive Case",
+      "parameters": [
+        { "name": "apikey",  "value": "${THEHIVE_API_KEY}" },
+        { "name": "url",     "value": "http://thehive:9000" },
+        { "name": "note",    "value": "AUTO-RESPONSE: IP $check-whitelist blocked via iptables for 60 minutes by Thor Shuffle at $(date '+%Y-%m-%d %H:%M:%S')" }
+      ]
+    }
+  ],
+  "start": "extract-ip"
+}
