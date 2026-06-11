@@ -60,3 +60,5 @@ winapi  = { version = "0.3", features = ["ws2ipdef", "windowsfilteringplatform"]
 [[bin]]
 name = "thor-agent"
 path = "src/main.rs"
+
+# OpenVAS / Thor Scanner dependencies (already included via reqwest + tokio)
