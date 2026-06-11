@@ -1,0 +1,324 @@
+# Thor Firewall — Integration Overlay Compose
+# الاستخدام: docker compose -f docker-compose.yml -f docker-compose.integrations.yml --profile integration up -d
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+networks:
+  thor-net:
+    external: true
+  thor-obs-net:
+    external: true
+
+volumes:
+  es_data:
+  kibana_data:
+  logstash_data:
+  suricata_logs:
+  suricata_rules:
+  shuffle_data:
+  shuffle_db_data:
+  ossec_data:
+  ossec_logs:
+  coraza_logs:
+  hayabusa_data:
+  wazuh_indexer_data:
+
+services:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ELK STACK — Elasticsearch + Logstash + Kibana
+# ─────────────────────────────────────────────────────────────────────────────
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    container_name: thor-elasticsearch
+    profiles: ["integration"]
+    restart: unless-stopped
+    environment:
+      - node.name=thor-es01
+      - cluster.name=thor-cluster
+      - discovery.type=single-node
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD:-ElasticThor2024!}
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=false
+      - ES_JAVA_OPTS=-Xms2g -Xmx2g
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - thor-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -su elastic:${ELASTIC_PASSWORD:-ElasticThor2024!} http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.4
+    container_name: thor-kibana
+    profiles: ["integration"]
+    restart: unless-stopped
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    ports:
+      - "5601:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: '["http://elasticsearch:9200"]'
+      ELASTICSEARCH_USERNAME: kibana_system
+      ELASTICSEARCH_PASSWORD: ${KIBANA_SYSTEM_PASSWORD:-KibanaThor2024!}
+      XPACK_SECURITY_ENABLED: "true"
+      XPACK_ENCRYPTEDsavedobjects_ENCRYPTIONKEY: ${KIBANA_ENCRYPTION_KEY:-changethisto32charsecretkey1234}
+    volumes:
+      - kibana_data:/usr/share/kibana/data
+    networks:
+      - thor-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5601/api/status | grep -q '\"level\":\"available\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.13.4
+    container_name: thor-logstash
+    profiles: ["integration"]
+    restart: unless-stopped
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    ports:
+      - "5044:5044"   # Beats input
+      - "5045:5045"   # Wazuh alerts input
+      - "9600:9600"   # API
+    environment:
+      LS_JAVA_OPTS: "-Xms512m -Xmx512m"
+      ELASTICSEARCH_HOST: "elasticsearch:9200"
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:-ElasticThor2024!}
+    volumes:
+      - ./configs/logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./configs/logstash/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+      - logstash_data:/usr/share/logstash/data
+    networks:
+      - thor-net
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WAZUH STACK — Manager + Indexer + Dashboard
+# (Standalone mode overriding the endpoint profile)
+# ─────────────────────────────────────────────────────────────────────────────
+
+  wazuh-indexer:
+    image: wazuh/wazuh-indexer:4.9.0
+    container_name: thor-wazuh-indexer
+    profiles: ["integration"]
+    restart: unless-stopped
+    ports:
+      - "9201:9200"
+    environment:
+      OPENSEARCH_JAVA_OPTS: "-Xms1g -Xmx1g"
+    volumes:
+      - wazuh_indexer_data:/var/lib/wazuh-indexer
+      - ./configs/wazuh/indexer.yml:/usr/share/wazuh-indexer/opensearch.yml:ro
+      - ./configs/wazuh/certs/indexer:/usr/share/wazuh-indexer/certs:ro
+    networks:
+      - thor-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sk https://localhost:9200/ | grep -q wazuh"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  wazuh-dashboard:
+    image: wazuh/wazuh-dashboard:4.9.0
+    container_name: thor-wazuh-dashboard
+    profiles: ["integration"]
+    restart: unless-stopped
+    depends_on:
+      - wazuh-manager
+      - wazuh-indexer
+    ports:
+      - "443:5601"
+    environment:
+      INDEXER_USERNAME: admin
+      INDEXER_PASSWORD: ${WAZUH_INDEXER_PASSWORD:-SecretPassword}
+      WAZUH_API_URL: https://wazuh-manager
+      WAZUH_API_PORT: "55000"
+      API_USERNAME: wazuh-wui
+      API_PASSWORD: ${WAZUH_API_PASSWORD:-MyS3cr37P450r.*-}
+    volumes:
+      - ./configs/wazuh/opensearch_dashboards.yml:/usr/share/wazuh-dashboard/config/opensearch_dashboards.yml:ro
+      - ./configs/wazuh/certs/dashboard:/usr/share/wazuh-dashboard/certs:ro
+    networks:
+      - thor-net
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SURICATA — Network Intrusion Detection System (NIDS)
+# ─────────────────────────────────────────────────────────────────────────────
+
+  suricata:
+    image: jasonish/suricata:latest
+    container_name: thor-suricata
+    profiles: ["integration"]
+    restart: unless-stopped
+    network_mode: host           # Required for packet capture
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_NICE
+    volumes:
+      - suricata_logs:/var/log/suricata
+      - suricata_rules:/var/lib/suricata/rules
+      - ./configs/suricata/suricata.yaml:/etc/suricata/suricata.yaml:ro
+    command: >
+      -i ${SURICATA_INTERFACE:-eth0}
+      --set outputs.1.eve-log.filename=/var/log/suricata/eve.json
+      -v
+    environment:
+      HOME_NET: ${HOME_NET:-[192.168.0.0/16,10.0.0.0/8,172.16.0.0/12]}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHUFFLE — Security Orchestration, Automation & Response (SOAR)
+# ─────────────────────────────────────────────────────────────────────────────
+
+  shuffle-backend:
+    image: ghcr.io/shuffle/shuffle-backend:latest
+    container_name: thor-shuffle-backend
+    profiles: ["integration"]
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    volumes:
+      - ./configs/shuffle/apps:/shuffle-apps:ro
+      - shuffle_data:/shuffle-files
+    environment:
+      DATASTORE_EMULATOR_HOST: shuffle-database:8000
+      SHUFFLE_APP_HOTLOAD_FOLDER: /shuffle-apps
+      SHUFFLE_FILE_LOCATION: /shuffle-files
+      SHUFFLE_OPENSEARCH_URL: http://elasticsearch:9200
+      SHUFFLE_OPENSEARCH_USERNAME: elastic
+      SHUFFLE_OPENSEARCH_PASSWORD: ${ELASTIC_PASSWORD:-ElasticThor2024!}
+      BASE_URL: http://localhost:3001
+      BACKEND_HOSTNAME: shuffle-backend
+    depends_on:
+      - shuffle-database
+    networks:
+      - thor-net
+
+  shuffle-frontend:
+    image: ghcr.io/shuffle/shuffle-frontend:latest
+    container_name: thor-shuffle-frontend
+    profiles: ["integration"]
+    restart: unless-stopped
+    ports:
+      - "3001:80"
+      - "3443:443"
+    environment:
+      BACKEND_HOSTNAME: shuffle-backend
+      BACKEND_PORT: "5001"
+    depends_on:
+      - shuffle-backend
+    networks:
+      - thor-net
+
+  shuffle-orborus:
+    image: ghcr.io/shuffle/shuffle-orborus:latest
+    container_name: thor-shuffle-orborus
+    profiles: ["integration"]
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      SHUFFLE_APP_SDK_VERSION: latest
+      ENVIRONMENT_NAME: Thor
+      BASE_URL: http://shuffle-backend:5001
+      DOCKER_API_VERSION: "1.40"
+      SHUFFLE_WORKER_SERVER_URL: http://shuffle-backend:5001
+    depends_on:
+      - shuffle-backend
+    networks:
+      - thor-net
+
+  shuffle-database:
+    image: fjogelid/datastore-emulator:latest
+    container_name: thor-shuffle-db
+    profiles: ["integration"]
+    restart: unless-stopped
+    volumes:
+      - shuffle_db_data:/storage
+    networks:
+      - thor-net
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OSSEC — Host Intrusion Detection System (HIDS)
+# ─────────────────────────────────────────────────────────────────────────────
+
+  ossec-hids:
+    image: atomicorp/ossec-docker:latest
+    container_name: thor-ossec
+    profiles: ["integration"]
+    restart: unless-stopped
+    ports:
+      - "1516:1514/udp"   # Syslog
+      - "1517:514/udp"    # Alternative syslog
+    volumes:
+      - ossec_data:/var/ossec/data
+      - ossec_logs:/var/ossec/logs
+      - ./configs/ossec/ossec.conf:/var/ossec/etc/ossec.conf:ro
+    environment:
+      OSSEC_MANAGER_TYPE: server
+      SYSLOG_ENABLE: "yes"
+      ELK_SERVER: elasticsearch:9200
+    networks:
+      - thor-net
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CORAZA WAF — Web Application Firewall (ModSecurity-compatible)
+# ─────────────────────────────────────────────────────────────────────────────
+
+  coraza-waf:
+    image: ghcr.io/corazawaf/coraza-caddy:latest
+    container_name: thor-coraza-waf
+    profiles: ["integration"]
+    restart: unless-stopped
+    ports:
+      - "8088:80"     # HTTP (protected upstream)
+      - "8443:443"    # HTTPS
+    volumes:
+      - ./configs/coraza/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./configs/coraza/coraza.conf:/etc/coraza-waf/coraza.conf:ro
+      - ./configs/coraza/rules:/etc/coraza-waf/rules:ro
+      - coraza_logs:/var/log/caddy
+    environment:
+      UPSTREAM_URL: http://control-plane:8000
+    networks:
+      - thor-net
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HAYABUSA — Windows Event Log Threat Hunter (batch analysis container)
+# ─────────────────────────────────────────────────────────────────────────────
+
+  hayabusa:
+    image: ghcr.io/yamatosecurity/hayabusa:latest
+    container_name: thor-hayabusa
+    profiles: ["integration"]
+    restart: "no"   # Run on-demand via `docker compose run hayabusa`
+    volumes:
+      - hayabusa_data:/data
+      - ./configs/hayabusa:/etc/hayabusa:ro
+    command: >
+      csv-timeline
+      -d /data/evtx
+      -o /data/results/timeline.csv
+      -p verbose
+      --no-wizard
+    networks:
+      - thor-net
