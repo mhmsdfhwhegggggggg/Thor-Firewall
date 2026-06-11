@@ -1,0 +1,44 @@
+rules_file:
+  - /etc/falco/falco_rules.yaml
+  - /etc/falco/falco_rules.local.yaml
+  - /etc/falco/rules.d
+plugins: []
+load_plugins: []
+watch_config_files: true
+time_format_iso_8601: true
+priority: debug
+json_output: true
+json_include_output_property: true
+json_include_tags_property: true
+log_stderr: true
+log_syslog: true
+log_level: info
+libs_logger:
+  enabled: false
+  severity: debug
+output_timeout: 2000
+outputs:
+  rate: 1
+  max_burst: 1000
+stdout_output:
+  enabled: true
+syslog_output:
+  enabled: false
+file_output:
+  enabled: true
+  keep_alive: false
+  filename: /var/log/falco/falco.log
+http_output:
+  enabled: true
+  url: "http://logstash:5044"
+  user_agent: "falcosecurity/falco"
+  insecure: true
+grpc:
+  enabled: false
+grpc_output:
+  enabled: false
+metadata_download:
+  enabled: true
+  max_mb: 100
+  chunk_wait_us: 1000
+  watch_freq_sec: 1
