@@ -1,0 +1,61 @@
+# Thor Firewall — Vector config: استيعاب وتوجيه السجلات من Wazuh و Suricata إلى Loki + Elasticsearch
+api:
+  enabled: true
+  address: "0.0.0.0:8686"
+sources:
+  wazuh_alerts:
+    type: file
+    include: ["/var/log/wazuh/alerts/*.json"]
+    data_dir: /var/lib/vector
+    read_from: beginning
+  suricata_eve:
+    type: file
+    include: ["/var/log/suricata/eve.json"]
+    data_dir: /var/lib/vector
+    read_from: beginning
+  syslog_input:
+    type: syslog
+    address: "0.0.0.0:9514"
+    mode: tcp
+transforms:
+  parse_wazuh:
+    type: remap
+    inputs: ["wazuh_alerts"]
+    source: |
+      . = parse_json!(string!(.message))
+      .thor_source = "wazuh"
+      .@timestamp = now()
+  parse_suricata:
+    type: remap
+    inputs: ["suricata_eve"]
+    source: |
+      . = parse_json!(string!(.message))
+      .thor_source = "suricata"
+  filter_high_severity:
+    type: filter
+    inputs: ["parse_wazuh"]
+    condition: '.rule.level != null && to_int!(.rule.level) >= 7'
+sinks:
+  to_loki_wazuh:
+    type: loki
+    inputs: ["parse_wazuh"]
+    endpoint: "http://loki:3100"
+    labels:
+      job: wazuh
+      level: "{{ rule.level }}"
+  to_loki_suricata:
+    type: loki
+    inputs: ["parse_suricata"]
+    endpoint: "http://loki:3100"
+    labels:
+      job: suricata
+      event_type: "{{ event_type }}"
+  to_elasticsearch:
+    type: elasticsearch
+    inputs: ["parse_wazuh", "parse_suricata"]
+    endpoints: ["http://elasticsearch:9200"]
+    auth:
+      strategy: basic
+      user: elastic
+      password: "${ELASTIC_PASSWORD}"
+    index: "thor-vector-%Y.%m.%d"
