@@ -1,0 +1,24 @@
+{
+    order coraza_waf first
+}
+
+:80 {
+    coraza_waf {
+        load_owasp_crs
+        directives `
+            Include /etc/coraza-waf/coraza.conf
+            Include /etc/coraza-waf/rules/*.conf
+            SecRuleEngine On
+            SecAuditLog /var/log/caddy/coraza-audit.log
+            SecAuditLogFormat JSON
+            SecRequestBodyAccess On
+            SecResponseBodyAccess On
+            SecResponseBodyMimeType text/plain text/html text/xml application/json
+        `
+    }
+    reverse_proxy {$UPSTREAM_URL:http://control-plane:8000}
+    log {
+        output file /var/log/caddy/access.log
+        format json
+    }
+}
