@@ -195,7 +195,7 @@ jobs:
       # ── Control Plane ──────────────────────────────────────────────────────
       - name: Extract control-plane metadata
         id: meta-cp
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE_BASE }}/control-plane
           tags: |
@@ -219,7 +219,7 @@ jobs:
       # ── Rust Agent ────────────────────────────────────────────────────────
       - name: Extract agent metadata
         id: meta-agent
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE_BASE }}/agent
           tags: |
@@ -240,7 +240,7 @@ jobs:
       # ── ML Inference ──────────────────────────────────────────────────────
       - name: Extract ML metadata
         id: meta-ml
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE_BASE }}/ml-inference
           tags: |
