@@ -12,7 +12,7 @@ jobs:
     name: Dependency Vulnerability Scan
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Rust cargo-audit
         run: |
@@ -41,7 +41,7 @@ jobs:
       matrix:
         language: [python, c-cpp]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: github/codeql-action/init@v3
         with:
           languages: ${{ matrix.language }}
@@ -52,7 +52,7 @@ jobs:
     name: Secret Scanning
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - uses: gitleaks/gitleaks-action@v2
@@ -64,7 +64,7 @@ jobs:
     runs-on: ubuntu-24.04
     if: github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Build agent image for scanning
         run: docker build -f docker/Dockerfile.agent -t thor-agent:scan .
       - name: Trivy container scan
